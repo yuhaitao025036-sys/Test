@@ -1,0 +1,16 @@
+# SWE-bench 评测依赖
+
+# 核心依赖
+openai>=1.0.0
+docker>=6.0.0
+datasets>=2.14.0
+pyarrow>=12.0.0
+pandas>=2.0.0
+
+# 可选依赖(用于不同数据格式)
+# pickle 是Python内置的
+
+# 注意: 如果遇到 libcst 编译问题,可以:
+# 1. 升级pip: python -m pip install --upgrade pip
+# 2. 或使用conda: conda install -c conda-forge datasets
+# 3. 或手动安装预编译的 libcst: pip install libcst --only-binary :all:
