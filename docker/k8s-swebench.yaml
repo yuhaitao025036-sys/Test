@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: swebench-evaluator
+  labels:
+    app: swebench
+spec:
+  restartPolicy: Never
+  
+  # 如果需要指定节点（可选）
+  # nodeSelector:
+  #   kubernetes.io/arch: amd64  # 确保在 x86_64 节点上运行
+  
+  containers:
+  - name: evaluator
+    image: python:3.13-slim
+    
+    # 资源限制
+    resources:
+      requests:
+        memory: "8Gi"
+        cpu: "4"
+        ephemeral-storage: "50Gi"  # 临时存储（镜像+容器）
+      limits:
+        memory: "16Gi"
+        cpu: "8"
+        ephemeral-storage: "100Gi"
+    
+    # 工作目录
+    workingDir: /workspace
+    
+    # 启动命令：保持容器运行
+    command: ["sleep"]
+    args: ["infinity"]
+    
+    # 挂载配置和数据
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+    - name: docker-sock
+      mountPath: /var/run/docker.sock  # 如果用宿主 Docker，保留此项
+    - name: dataset
+      mountPath: /datasets
+      readOnly: true
+    - name: config
+      mountPath: /config
+      readOnly: true
+    
+    env:
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: LOCAL_DATASET_PATH
+      value: "/datasets/SWE-bench_Pro/test-00000-of-00001.parquet"
+    - name: CONFIG_PATH
+      value: "/config/experience.json"
+    - name: DOCKER_HOST
+      value: "tcp://localhost:2375"  # 使用 DinD sidecar
+  
+  # 可选：添加 Docker-in-Docker sidecar
+  - name: docker-daemon
+    image: docker:27-dind
+    securityContext:
+      privileged: true  # DinD 需要特权模式
+    
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "1"
+      limits:
+        memory: "4Gi"
+        cpu: "2"
+    
+    volumeMounts:
+    - name: docker-storage
+      mountPath: /var/lib/docker
+  
+  volumes:
+  - name: workspace
+    emptyDir:
+      sizeLimit: 10Gi
+  
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+      type: Socket
+  
+  - name: docker-storage
+    emptyDir:
+      sizeLimit: 50Gi
+  
+  - name: dataset
+    persistentVolumeClaim:
+      claimName: swebench-dataset-pvc  # 需要预先创建 PVC
+      # 或者用 hostPath（如果数据在节点上）:
+      # hostPath:
+      #   path: /data/swebench
+      #   type: Directory
+  
+  - name: config
+    configMap:
+      name: swebench-config
+      items:
+      - key: experience.json
+        path: experience.json
+
+---
+# 数据集 PVC（如果使用 PVC）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swebench-dataset-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: your-storage-class
+
+---
+# ConfigMap - API 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: swebench-config
+data:
+  experience.json: |
+    {
+      "raw_llm_api": {
+        "api_key": "YOUR_API_KEY_HERE",
+        "base_url": "https://oneapi-comate.baidu-int.com/v1",
+        "model": "MiniMax-M2.5"
+      }
+    }

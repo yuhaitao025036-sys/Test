@@ -1,0 +1,25 @@
+{
+  "summary": {
+    "total_instances": 1,
+    "passed": 1,
+    "passed_rate": "100.0%"
+  },
+  "metrics": {
+    "pass_to_pass": 0,
+    "fail_to_pass": 1,
+    "pass_to_fail": 0,
+    "fail_to_fail": 0,
+    "resolved_count": 1
+  },
+  "details": [
+    {
+      "instance_id": "instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan",
+      "passed": true,
+      "pass_to_pass": 0,
+      "fail_to_pass": 1,
+      "pass_to_fail": 0,
+      "fail_to_fail": 0,
+      "error": ""
+    }
+  ]
+}
