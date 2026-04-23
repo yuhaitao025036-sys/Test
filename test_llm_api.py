@@ -539,6 +539,7 @@ def main():
     parser = argparse.ArgumentParser(description='SWE-bench Pro LLM 评测')
     parser.add_argument('--instance-id', type=str, help='指定任务ID')
     parser.add_argument('--index', type=int, help='任务索引（从0开始）')
+    parser.add_argument('--max-tasks', type=int, help='最多处理N个任务')
     parser.add_argument('--no-validate', action='store_true', help='跳过验证')
     parser.add_argument('--output-dir', default='./swe_bench_output', help='输出目录')
     parser.add_argument('--analysis', action='store_true', help='分析已有结果')
@@ -551,8 +552,8 @@ def main():
     global ENABLE_VALIDATION
     ENABLE_VALIDATION = not args.no_validate
 
-    if not args.instance_id and args.index is None:
-        parser.error("必须指定 --instance-id 或 --index")
+    if not args.instance_id and args.index is None and not args.max_tasks:
+        parser.error("必须指定 --instance-id, --index 或 --max-tasks")
 
     # 加载配置
     try:
@@ -579,7 +580,10 @@ def main():
         dataset = evaluator.load_dataset()
         
         # 选择任务
+        instances_to_process = []
+        
         if args.instance_id:
+            # 单个任务by ID
             instance = None
             for item in dataset:
                 if item['instance_id'] == args.instance_id:
@@ -588,27 +592,48 @@ def main():
             if not instance:
                 print(f"✗ 未找到任务 {args.instance_id}")
                 return
-        else:
+            instances_to_process = [instance]
+        elif args.index is not None:
+            # 单个任务by索引
             if args.index >= len(dataset):
                 print(f"✗ 索引超出范围（数据集共 {len(dataset)} 个任务）")
                 return
-            instance = dataset[args.index]
+            instances_to_process = [dataset[args.index]]
+        elif args.max_tasks:
+            # 批量处理前N个任务
+            max_tasks = min(args.max_tasks, len(dataset))
+            instances_to_process = [dataset[i] for i in range(max_tasks)]
+            print(f"\n将处理前 {len(instances_to_process)} 个任务")
 
-        instance_id = instance['instance_id']
-        print(f"\n开始评测任务: {instance_id}")
+        # 处理所有任务
+        results_of_this_run = []
+        for idx, instance in enumerate(instances_to_process, 1):
+            instance_id = instance['instance_id']
+            print(f"\n[{idx}/{len(instances_to_process)}] 开始评测任务: {instance_id}")
+            
+            try:
+                result = evaluator.evaluate_single(instance)
+                results_of_this_run.append(result)
+                
+                # 保存结果
+                save_result_harness_format(result, predictions_dir, args.output_dir)
+                
+                print(f"\n{'='*60}")
+                print(f"任务ID: {instance_id}")
+                print(f"Patch生成: {'✓' if result.get('patch') else '✗'}")
+                if result.get('validation'):
+                    print(f"验证结果: {'✓ 通过' if result.get('validation', {}).get('success') else '✗ 失败'}")
+                print(f"结果保存到: {args.output_dir}")
+                print(f"{'='*60}")
+            except Exception as e:
+                print(f"✗ 任务 {instance_id} 失败: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
-        result = evaluator.evaluate_single(instance)
-        
-        # 保存结果
-        save_result_harness_format(result, predictions_dir, args.output_dir)
-        
-        print(f"\n{'='*60}")
-        print(f"任务ID: {instance_id}")
-        print(f"Patch生成: {'✓' if result.get('patch') else '✗'}")
-        if result.get('validation'):
-            print(f"验证结果: {'✓ 通过' if result.get('validation', {}).get('success') else '✗ 失败'}")
-        print(f"结果保存到: {args.output_dir}")
-        print(f"{'='*60}")
+        # 批量处理完成后,生成本次运行的汇总报告
+        if len(instances_to_process) > 1:
+            generate_report_for_run(results_of_this_run, args.output_dir)
 
     except KeyboardInterrupt:
         print("\n\n用户中断")
@@ -684,7 +709,128 @@ def analyze_results(output_dir: str):
     if validated:
         print(f"已验证: {len(validated)}/{total}")
         print(f"✓ 已解决: {len(resolved)}/{len(validated)} ({len(resolved)/len(validated)*100:.1f}%)")
-        print(f"★ Resolved率: {len(resolved)/total*100:.1f}%")
+        print(f"★ Resolve Rate: {len(resolved)/total*100:.1f}%")
+    print(f"{'='*70}\n")
+
+
+def generate_report_for_run(results: list, output_dir: str):
+    """生成本次运行的官方格式report.json"""
+    import time
+    
+    if not results:
+        return
+    
+    # 统计
+    total = len(results)
+    resolved_list = []
+    unresolved_list = []
+    errors_dict = {}
+    
+    for r in results:
+        instance_id = r.get('instance_id', 'unknown')
+        validation = r.get('validation', {})
+        
+        if validation.get('success'):
+            resolved_list.append(instance_id)
+        elif 'error' in validation:
+            errors_dict[instance_id] = validation['error']
+            unresolved_list.append(instance_id)
+        elif validation:
+            unresolved_list.append(instance_id)
+    
+    resolve_rate = len(resolved_list) / total if total > 0 else 0
+    
+    # 生成报告
+    report = {
+        'total_instances': total,
+        'resolved_instances': len(resolved_list),
+        'resolve_rate': round(resolve_rate, 4),
+        'resolved': resolved_list,
+        'unresolved': unresolved_list,
+        'errors': errors_dict,
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'model': 'llm_api'
+    }
+    
+    report_file = os.path.join(output_dir, 'report.json')
+    with open(report_file, 'w') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n{'='*70}")
+    print(f"📊 本次运行报告: {report_file}")
+    print(f"{'='*70}")
+    print(f"Total Instances: {total}")
+    print(f"Resolved: {len(resolved_list)} ({resolve_rate*100:.1f}%)")
+    print(f"Unresolved: {len(unresolved_list)}")
+    print(f"Errors: {len(errors_dict)}")
+    print(f"{'='*70}\n")
+
+
+def generate_report(output_dir: str):
+    """生成官方格式的report.json"""
+    import time
+    
+    summary_file = os.path.join(output_dir, 'all_results.jsonl')
+    
+    if not os.path.exists(summary_file):
+        print("⚠️  没有找到结果文件,跳过报告生成")
+        return
+    
+    results = []
+    with open(summary_file, 'r') as f:
+        for line in f:
+            if line.strip():
+                try:
+                    results.append(json.loads(line))
+                except:
+                    continue
+    
+    if not results:
+        return
+    
+    # 统计
+    total = len(results)
+    resolved_list = []
+    unresolved_list = []
+    errors_dict = {}
+    
+    for r in results:
+        instance_id = r.get('instance_id', 'unknown')
+        validation = r.get('validation', {})
+        
+        if validation.get('success'):
+            resolved_list.append(instance_id)
+        elif 'error' in validation:
+            errors_dict[instance_id] = validation['error']
+            unresolved_list.append(instance_id)
+        elif validation:
+            unresolved_list.append(instance_id)
+    
+    resolve_rate = len(resolved_list) / total if total > 0 else 0
+    
+    # 生成报告
+    report = {
+        'total_instances': total,
+        'resolved_instances': len(resolved_list),
+        'resolve_rate': round(resolve_rate, 4),
+        'resolved': resolved_list,
+        'unresolved': unresolved_list,
+        'errors': errors_dict,
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'model': 'llm_api'
+    }
+    
+    report_file = os.path.join(output_dir, 'report.json')
+    with open(report_file, 'w') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n{'='*70}")
+    print(f"📊 全部历史报告已生成: {report_file}")
+    print(f"{'='*70}")
+    print(f"Total Instances: {total}")
+    print(f"Resolved: {len(resolved_list)} ({resolve_rate*100:.1f}%)")
+    print(f"Unresolved: {len(unresolved_list)}")
+    print(f"Errors: {len(errors_dict)}")
     print(f"{'='*70}\n")
 
 
