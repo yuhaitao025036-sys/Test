@@ -311,7 +311,7 @@ class SimpleDuccEvaluator:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
     
-    def call_ducc(self, prompt: str, workspace: str, timeout: int = 600, use_tmux: bool = False, instance_id: str = "") -> str:
+    def call_ducc(self, prompt: str, workspace: str, timeout: int = 600, use_tmux: bool = False, instance_id: str = "", task_dir: str = "") -> str:
         """调用 ducc - 支持直接调用和tmux模式
         
         Args:
@@ -320,22 +320,41 @@ class SimpleDuccEvaluator:
             timeout: 超时时间（秒），默认600秒（10分钟）
             use_tmux: 是否使用tmux模式运行
             instance_id: 任务ID，用于生成tmux session名称
+            task_dir: 任务输出目录，用于保存日志
         """
         print(f"\n正在调用 ducc...")
         print(f"  二进制: {self.ducc_bin}")
         print(f"  工作目录: {workspace}")
         print(f"  超时设置: {timeout}秒")
         print(f"  运行模式: {'tmux模式' if use_tmux else '直接模式'}")
-        print(f"  prompt: {prompt[:200]}..." if len(prompt) > 200 else f"  prompt: {prompt}")
+        print(f"  prompt 长度: {len(prompt)} 字符")
+        
+        # 保存完整 prompt 到文件
+        if task_dir:
+            prompt_file = os.path.join(task_dir, 'prompt.txt')
+            try:
+                with open(prompt_file, 'w', encoding='utf-8') as f:
+                    f.write(prompt)
+                print(f"  ✓ Prompt 已保存: {prompt_file}")
+            except Exception as e:
+                print(f"  ⚠️  保存 prompt 失败: {e}")
+        
+        # 打印 prompt 预览
+        lines = prompt.split('\n')
+        print(f"  Prompt 预览 (前5行):")
+        for i, line in enumerate(lines[:5], 1):
+            print(f"    {i}. {line[:80]}{'...' if len(line) > 80 else ''}")
+        if len(lines) > 5:
+            print(f"    ... (共 {len(lines)} 行)")
         
         if use_tmux:
             # 使用tmux模式
-            return self._call_ducc_tmux(prompt, workspace, timeout, instance_id)
+            return self._call_ducc_tmux(prompt, workspace, timeout, instance_id, task_dir)
         else:
             # 直接调用模式（原有逻辑）
-            return self._call_ducc_direct(prompt, workspace, timeout)
+            return self._call_ducc_direct(prompt, workspace, timeout, task_dir)
     
-    def _call_ducc_direct(self, prompt: str, workspace: str, timeout: int) -> str:
+    def _call_ducc_direct(self, prompt: str, workspace: str, timeout: int, task_dir: str = "") -> str:
         """直接调用 ducc（原有实现）"""
         # 构建命令
         cmd = [
@@ -357,8 +376,15 @@ class SimpleDuccEvaluator:
         env['DUCC_AUTO_APPROVE'] = '1'
         env['CI'] = 'true'
         
+        # 准备日志文件
+        log_file = None
+        if task_dir:
+            log_file = os.path.join(task_dir, 'ducc_execution.log')
+        
         try:
             print(f"  开始时间: {time.strftime('%H:%M:%S')}")
+            start_time = time.time()
+            
             result = subprocess.run(
                 cmd,
                 cwd=workspace,
@@ -369,11 +395,41 @@ class SimpleDuccEvaluator:
                 timeout=timeout,
                 input='y\n' * 100,
             )
+            
+            duration = time.time() - start_time
             print(f"  完成时间: {time.strftime('%H:%M:%S')}")
+            print(f"  执行耗时: {duration:.2f}秒")
+            
+            # 保存完整输出到日志文件
+            if log_file:
+                try:
+                    with open(log_file, 'w', encoding='utf-8') as f:
+                        f.write("=" * 80 + "\n")
+                        f.write("DUCC 执行日志\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+                        f.write(f"结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"执行耗时: {duration:.2f}秒\n")
+                        f.write(f"退出码: {result.returncode}\n")
+                        f.write(f"工作目录: {workspace}\n")
+                        f.write("=" * 80 + "\n\n")
+                        
+                        f.write("STDOUT:\n")
+                        f.write("-" * 80 + "\n")
+                        f.write(result.stdout)
+                        f.write("\n" + "-" * 80 + "\n\n")
+                        
+                        f.write("STDERR:\n")
+                        f.write("-" * 80 + "\n")
+                        f.write(result.stderr)
+                        f.write("\n" + "-" * 80 + "\n")
+                    print(f"  ✓ 执行日志已保存: {log_file}")
+                except Exception as e:
+                    print(f"  ⚠️  保存日志失败: {e}")
             
             if result.returncode != 0:
                 print(f"⚠️  ducc 返回非零退出码: {result.returncode}")
-                print(f"stderr: {result.stderr[:500]}")
+                print(f"stderr 预览: {result.stderr[:200]}...")
             
             output = result.stdout
             if not output and result.returncode != 0:
@@ -385,12 +441,38 @@ class SimpleDuccEvaluator:
         
         except subprocess.TimeoutExpired:
             print(f"✗ ducc 执行超时 ({timeout}秒 = {timeout//60}分钟)")
+            
+            # 保存超时信息
+            if log_file:
+                try:
+                    with open(log_file, 'w', encoding='utf-8') as f:
+                        f.write("=" * 80 + "\n")
+                        f.write("DUCC 执行超时\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(f"超时时间: {timeout}秒\n")
+                        f.write(f"工作目录: {workspace}\n")
+                except:
+                    pass
+            
             return ""
         except Exception as e:
             print(f"✗ ducc 执行失败: {e}")
+            
+            # 保存错误信息
+            if log_file:
+                try:
+                    with open(log_file, 'w', encoding='utf-8') as f:
+                        f.write("=" * 80 + "\n")
+                        f.write("DUCC 执行异常\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(f"错误: {str(e)}\n")
+                        f.write(f"工作目录: {workspace}\n")
+                except:
+                    pass
+            
             return ""
     
-    def _call_ducc_tmux(self, prompt: str, workspace: str, timeout: int, instance_id: str) -> str:
+    def _call_ducc_tmux(self, prompt: str, workspace: str, timeout: int, instance_id: str, task_dir: str = "") -> str:
         """使用tmux模式调用 ducc"""
         import re
         
@@ -405,28 +487,88 @@ class SimpleDuccEvaluator:
         print(f"{'='*60}\n")
         
         try:
-            # 1. 创建tmux session
+            # 1. 创建tmux session，使用登录 shell 以确保环境正确初始化
+            # 检测当前使用的 shell
+            current_shell = os.environ.get('SHELL', '/bin/bash')
+            
             subprocess.run(
                 ["tmux", "new-session", "-d", "-s", session_name, "-c", workspace],
                 check=True
             )
             print(f"✓ tmux session 已创建")
             
-            # 2. 构建ducc命令
+            # 2. 检测并激活 conda 环境（如果需要）
+            # 优先级: CONDA_DEFAULT_ENV > DEFAULT_CONDA_ENV > 硬编码默认值
+            conda_env = os.environ.get('CONDA_DEFAULT_ENV') or \
+                       os.environ.get('DEFAULT_CONDA_ENV', 'dejavu')
+            
+            if os.environ.get('CONDA_DEFAULT_ENV'):
+                print(f"  检测到当前 conda 环境: {conda_env}")
+            else:
+                print(f"  使用默认 conda 环境: {conda_env}")
+            
+            # 尝试激活 conda 环境
+            if conda_env:
+                # 方案A: 如果用户在 bashrc/zshrc 中配置了 conda init，直接激活
+                # 方案B: 手动 source conda.sh
+                
+                # 尝试找到 conda 安装路径
+                conda_exe = shutil.which('conda')
+                if conda_exe:
+                    # 获取 conda 基础路径
+                    conda_base = os.path.dirname(os.path.dirname(conda_exe))
+                    conda_sh = os.path.join(conda_base, 'etc/profile.d/conda.sh')
+                    
+                    if os.path.exists(conda_sh):
+                        # 使用 conda.sh 初始化
+                        init_and_activate = f'source {conda_sh} && conda activate {conda_env}'
+                        subprocess.run(
+                            ["tmux", "send-keys", "-t", session_name, init_and_activate, "Enter"],
+                            check=True
+                        )
+                        print(f"  ✓ 使用 conda.sh 初始化: {conda_sh}")
+                    else:
+                        # 直接尝试 conda activate
+                        subprocess.run(
+                            ["tmux", "send-keys", "-t", session_name, f"conda activate {conda_env}", "Enter"],
+                            check=True
+                        )
+                        print(f"  ⚠️  直接调用 conda activate（可能需要在 shell 配置中初始化 conda）")
+                else:
+                    print(f"  ⚠️  未找到 conda 命令，跳过环境激活")
+                
+                # 等待环境激活
+                time.sleep(2)
+                
+                # 验证环境
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "echo 'ENV: '$CONDA_DEFAULT_ENV", "Enter"],
+                    check=True
+                )
+                time.sleep(0.5)
+                content = self._tmux_capture_pane(session_name)
+                if conda_env in content:
+                    print(f"  ✓ conda 环境激活成功: {conda_env}")
+                else:
+                    print(f"  ⚠️  环境激活可能失败，继续尝试...")
+            else:
+                print(f"  跳过 conda 环境激活")
+            
+            # 3. 构建ducc命令
             permission_mode = "bypassPermissions" if os.geteuid() != 0 else "default"
             ducc_cmd = f'IS_SANDBOX=1 {self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write" --effort low'
             
-            # 3. 在tmux中启动ducc
+            # 4. 在tmux中启动ducc
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, ducc_cmd, "Enter"],
                 check=True
             )
             print(f"✓ ducc 命令已发送")
             
-            # 4. 等待ducc启动
+            # 5. 等待ducc启动
             time.sleep(3)
             
-            # 5. 自动确认trust folder等提示
+            # 6. 自动确认trust folder等提示
             auto_confirm_patterns = {
                 "Do you want to proceed": "Enter",
                 "Yes, I trust this folder": "Enter",
@@ -448,21 +590,46 @@ class SimpleDuccEvaluator:
                     break
                 time.sleep(1)
             
-            # 6. 等待ducc就绪
+            # 7. 等待ducc就绪
             time.sleep(2)
             
-            # 7. 发送prompt
+            # 8. 发送prompt
             print(f"✓ 发送任务prompt")
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, prompt, "Enter"],
                 check=True
             )
             
-            # 8. 监控执行直到完成
+            # 9. 监控执行直到完成
             print(f"✓ 开始监控执行...")
+            start_time = time.time()
             output = self._wait_for_ducc_completion(session_name, timeout)
+            duration = time.time() - start_time
             
-            print(f"\n✓ 任务执行完成")
+            # 保存tmux输出到日志
+            if task_dir:
+                log_file = os.path.join(task_dir, 'ducc_execution.log')
+                try:
+                    with open(log_file, 'w', encoding='utf-8') as f:
+                        f.write("=" * 80 + "\n")
+                        f.write("DUCC 执行日志 (tmux模式)\n")
+                        f.write("=" * 80 + "\n")
+                        f.write(f"Session: {session_name}\n")
+                        f.write(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+                        f.write(f"结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"执行耗时: {duration:.2f}秒\n")
+                        f.write(f"工作目录: {workspace}\n")
+                        f.write("=" * 80 + "\n\n")
+                        
+                        f.write("Tmux 捕获内容:\n")
+                        f.write("-" * 80 + "\n")
+                        f.write(output)
+                        f.write("\n" + "-" * 80 + "\n")
+                    print(f"  ✓ 执行日志已保存: {log_file}")
+                except Exception as e:
+                    print(f"  ⚠️  保存日志失败: {e}")
+            
+            print(f"\n✓ 任务执行完成 (耗时: {duration:.2f}秒)")
             print(f"  Session保持活跃: tmux attach -t {session_name}")
             print(f"  关闭session: tmux kill-session -t {session_name}")
             
@@ -580,7 +747,90 @@ class SimpleDuccEvaluator:
         # 返回最终内容
         return self._tmux_capture_pane(session_name)
     
-    def evaluate_single(self, instance: Dict) -> Dict:
+    def _save_task_summary(self, task_dir: str, result: Dict, start_time: float):
+        """保存任务执行摘要"""
+        summary_file = os.path.join(task_dir, 'task_summary.json')
+        try:
+            end_time = time.time()
+            summary = {
+                'instance_id': result.get('instance_id', ''),
+                'start_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time)),
+                'end_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time)),
+                'duration_seconds': result.get('duration', end_time - start_time),
+                'patch_generated': bool(result.get('patch', '')),
+                'patch_length': len(result.get('patch', '')),
+                'validation_performed': bool(result.get('validation')),
+                'validation_success': result.get('validation', {}).get('success', False) if result.get('validation') else None,
+                'error': result.get('error', ''),
+                'task_directory': task_dir,
+            }
+            
+            # 添加验证详情
+            if result.get('validation'):
+                summary['validation_details'] = {
+                    'test_output_length': len(result['validation'].get('test_output', '')),
+                    'exit_code': result['validation'].get('exit_code'),
+                    'test_duration': result['validation'].get('test_duration'),
+                    'stats': result['validation'].get('stats', {}),
+                }
+            
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
+            
+            print(f"✓ 任务摘要已保存: {summary_file}")
+            
+            # 同时保存一个简洁的文本摘要
+            summary_text_file = os.path.join(task_dir, 'README.txt')
+            with open(summary_text_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"SWE-bench 任务执行摘要\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"任务 ID: {summary['instance_id']}\n")
+                f.write(f"开始时间: {summary['start_time']}\n")
+                f.write(f"结束时间: {summary['end_time']}\n")
+                f.write(f"执行耗时: {summary['duration_seconds']:.2f}秒\n\n")
+                
+                f.write(f"Patch 生成: {'✓ 是' if summary['patch_generated'] else '✗ 否'}\n")
+                if summary['patch_generated']:
+                    f.write(f"Patch 长度: {summary['patch_length']} 字符\n")
+                f.write("\n")
+                
+                if summary['validation_performed']:
+                    f.write(f"验证执行: ✓ 是\n")
+                    f.write(f"验证结果: {'✓ 通过' if summary['validation_success'] else '✗ 失败'}\n")
+                    if summary.get('validation_details'):
+                        vd = summary['validation_details']
+                        f.write(f"  - 退出码: {vd.get('exit_code')}\n")
+                        f.write(f"  - 测试耗时: {vd.get('test_duration', 0):.2f}秒\n")
+                        if vd.get('stats'):
+                            stats = vd['stats']
+                            f.write(f"  - 通过: {stats.get('passed', 0)}\n")
+                            f.write(f"  - 失败: {stats.get('failed', 0)}\n")
+                            f.write(f"  - 错误: {stats.get('errors', 0)}\n")
+                else:
+                    f.write(f"验证执行: ✗ 否\n")
+                
+                if summary['error']:
+                    f.write(f"\n错误: {summary['error']}\n")
+                
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("文件说明:\n")
+                f.write("=" * 80 + "\n")
+                f.write("  dataset_info.json      - 数据集原始信息\n")
+                f.write("  prompt.txt             - 发送给 ducc 的 prompt\n")
+                f.write("  ducc_execution.log     - ducc 执行日志（含stdout/stderr）\n")
+                f.write("  ducc_raw_output.txt    - ducc 原始输出\n")
+                f.write("  extracted_patch.diff   - 提取的 patch\n")
+                f.write("  validation_result.json - 验证结果详情\n")
+                f.write("  task_summary.json      - 任务摘要（JSON格式）\n")
+                f.write("  README.txt             - 本文件（文本摘要）\n")
+                
+            print(f"✓ 文本摘要已保存: {summary_text_file}")
+            
+        except Exception as e:
+            print(f"⚠️  保存任务摘要失败: {e}")
+    
+    def evaluate_single(self, instance: Dict, output_dir: str = './swe_bench_output_ducc') -> Dict:
         """评估单个任务"""
         instance_id = instance['instance_id']
         
@@ -588,30 +838,88 @@ class SimpleDuccEvaluator:
         print(f"处理任务: {instance_id}")
         print(f"{'='*60}")
         
+        # 创建任务专属目录
+        # 使用安全的文件名（替换特殊字符）
+        safe_instance_id = instance_id.replace('/', '_').replace('\\', '_').replace(':', '_')
+        task_dir = os.path.join(output_dir, 'tasks', safe_instance_id)
+        os.makedirs(task_dir, exist_ok=True)
+        print(f"任务目录: {task_dir}")
+        
+        # 保存原始数据集信息
+        dataset_info_file = os.path.join(task_dir, 'dataset_info.json')
+        try:
+            with open(dataset_info_file, 'w', encoding='utf-8') as f:
+                # 保存数据集的完整信息
+                dataset_info = {
+                    'instance_id': instance_id,
+                    'repo': instance.get('repo', ''),
+                    'repo_language': instance.get('repo_language', ''),
+                    'problem_statement': instance.get('problem_statement', ''),
+                    'requirements': instance.get('requirements', ''),
+                    'interface': instance.get('interface', ''),
+                    'dockerhub_tag': instance.get('dockerhub_tag', ''),
+                    'base_commit': instance.get('base_commit', ''),
+                    'hints': instance.get('hints', ''),
+                    'created_at': instance.get('created_at', ''),
+                }
+                json.dump(dataset_info, f, indent=2, ensure_ascii=False)
+            print(f"✓ 数据集信息已保存: {dataset_info_file}")
+        except Exception as e:
+            print(f"⚠️  保存数据集信息失败: {e}")
+        
         start_time = time.time()
         tmpdir_to_cleanup = None
         
         try:
             # 1. 提取整个代码库到本地
-            print("正在提取代码库...")
+            print("\n正在提取代码库...")
             workspace, container_workdir, tmpdir_to_cleanup = self.extract_codebase(instance)
             
             # 2. 构建简化的 prompt (agent 可以自己探索代码)
             prompt = self._build_prompt(instance)
             
             # 3. 调用 ducc (agent 在 workspace 目录操作)
-            output = self.call_ducc(prompt, workspace, use_tmux=self.use_tmux, instance_id=instance_id)
+            output = self.call_ducc(
+                prompt, 
+                workspace, 
+                use_tmux=self.use_tmux, 
+                instance_id=instance_id,
+                task_dir=task_dir
+            )
+            
+            # 保存ducc原始输出
+            raw_output_file = os.path.join(task_dir, 'ducc_raw_output.txt')
+            try:
+                with open(raw_output_file, 'w', encoding='utf-8') as f:
+                    f.write(output if output else "(空输出)")
+                print(f"✓ Ducc 原始输出已保存: {raw_output_file}")
+            except Exception as e:
+                print(f"⚠️  保存原始输出失败: {e}")
             
             if not output:
-                return {
+                error_result = {
                     'instance_id': instance_id,
                     'patch': '',
                     'error': 'ducc returned empty output',
-                    'validation': {'success': False, 'error': 'Empty output'}
+                    'validation': {'success': False, 'error': 'Empty output'},
+                    'task_dir': task_dir,
                 }
+                # 保存错误信息
+                self._save_task_summary(task_dir, error_result, start_time)
+                return error_result
             
             # 4. 提取 patch
             patch = self._extract_patch(output)
+            
+            # 保存提取的patch
+            if patch:
+                patch_file = os.path.join(task_dir, 'extracted_patch.diff')
+                try:
+                    with open(patch_file, 'w', encoding='utf-8') as f:
+                        f.write(patch)
+                    print(f"✓ Patch 已保存: {patch_file}")
+                except Exception as e:
+                    print(f"⚠️  保存 patch 失败: {e}")
             
             duration = time.time() - start_time
             print(f"\n✓ 处理完成: {duration:.2f}s")
@@ -641,13 +949,28 @@ class SimpleDuccEvaluator:
                 print("\n正在验证 patch...")
                 validation_result = self.validate_patch(instance, patch, container_workdir)
                 print(f"验证结果: {'✓ 通过' if validation_result.get('success') else '✗ 失败'}")
+                
+                # 保存验证结果
+                validation_file = os.path.join(task_dir, 'validation_result.json')
+                try:
+                    with open(validation_file, 'w', encoding='utf-8') as f:
+                        json.dump(validation_result, f, indent=2)
+                    print(f"✓ 验证结果已保存: {validation_file}")
+                except Exception as e:
+                    print(f"⚠️  保存验证结果失败: {e}")
             
-            return {
+            result = {
                 'instance_id': instance_id,
                 'patch': patch,
                 'duration': duration,
                 'validation': validation_result,
+                'task_dir': task_dir,
             }
+            
+            # 保存任务摘要
+            self._save_task_summary(task_dir, result, start_time)
+            
+            return result
         
         finally:
             # 清理临时目录
@@ -657,23 +980,32 @@ class SimpleDuccEvaluator:
     
     def _build_prompt(self, instance: Dict) -> str:
         """构建 prompt (agent 可以自己探索代码,不需要提供文件列表)"""
+        # 清理 problem_statement，移除可能的序列化引号
+        problem_stmt = instance['problem_statement']
+        if isinstance(problem_stmt, str):
+            # 移除开头和结尾的引号（如果是被序列化的）
+            if problem_stmt.startswith('"') and problem_stmt.endswith('"'):
+                problem_stmt = problem_stmt[1:-1]
+            # 替换转义的换行符为真实换行符
+            problem_stmt = problem_stmt.replace('\\n', '\n')
+        
         requirements = f"\n## Requirements\n{instance['requirements']}\n" if instance.get('requirements') else ""
         interface = f"\n## Interface\n{instance['interface']}\n" if instance.get('interface') else ""
         
         return f"""You are a software engineer fixing a bug. The codebase is in the current directory.
 
 ## Problem Statement
-{instance['problem_statement']}
+{problem_stmt}
 {requirements}{interface}
 
 ## Task
 1. Explore the codebase in the current directory to understand the structure
 2. Locate the relevant files related to this issue
 3. Generate a patch that fixes the issue with minimal, targeted changes
-4. Output the patch in unified diff format
+4. Output ONLY the patch in unified diff format (no explanations)
 
 ## Output Format
-Output the patch in unified diff format:
+Output the patch in unified diff format (and nothing else):
 ```diff
 diff --git a/file.py b/file.py
 --- a/file.py
@@ -683,7 +1015,7 @@ diff --git a/file.py b/file.py
 +    new_line
 ```
 
-Generate the patch now."""
+Generate the patch now. Do not include any explanation or commentary, only output the diff."""
     
     def _extract_patch(self, output: str) -> str:
         """从 ducc 输出提取 patch"""
@@ -1001,6 +1333,8 @@ def save_result(result: Dict, output_dir: str):
     os.makedirs(predictions_dir, exist_ok=True)
     
     instance_id = result['instance_id']
+    # 使用安全的文件名
+    safe_instance_id = instance_id.replace('/', '_').replace('\\', '_').replace(':', '_')
     
     # 官方格式: 单个预测 (用于调试)
     prediction = {
@@ -1008,18 +1342,24 @@ def save_result(result: Dict, output_dir: str):
         'model_patch': result.get('patch', ''),
         'model_name_or_path': 'ducc_standalone',
     }
-    with open(os.path.join(predictions_dir, f"{instance_id}.json"), 'w') as f:
+    with open(os.path.join(predictions_dir, f"{safe_instance_id}.json"), 'w', encoding='utf-8') as f:
         json.dump(prediction, f, indent=2)
     
     # 官方格式: JSONL (用于批量评估)
-    with open(os.path.join(output_dir, 'all_preds.jsonl'), 'a') as f:
+    with open(os.path.join(output_dir, 'all_preds.jsonl'), 'a', encoding='utf-8') as f:
         f.write(json.dumps(prediction) + '\n')
     
     # 完整结果 (包含 validation 等额外信息)
-    with open(os.path.join(output_dir, f"{instance_id}_full.json"), 'w') as f:
-        json.dump(result, f, indent=2)
+    # 注意: 移除 task_dir 字段避免路径过长
+    result_copy = result.copy()
+    task_dir = result_copy.pop('task_dir', '')
+    
+    with open(os.path.join(output_dir, f"{safe_instance_id}_full.json"), 'w', encoding='utf-8') as f:
+        json.dump(result_copy, f, indent=2)
     
     print(f"✓ 结果已保存到 {output_dir}")
+    if task_dir:
+        print(f"✓ 任务详情目录: {task_dir}")
 
 
 def generate_report(results: list, output_dir: str):
@@ -1053,7 +1393,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='SWE-bench Pro DUCC 评测 (支持 tmux 实时查看, 无 Experience 依赖)',
+        description='SWE-bench Pro DUCC 评测 (支持 tmux 实时查看, 自动 conda 环境)',
         epilog="""
 说明:
   SWE-bench Pro 包含41个多语言仓库,官方 swebench.harness 不支持
@@ -1061,13 +1401,23 @@ def main():
   
   【tmux 模式说明】
   使用 --use-tmux 参数可以在 tmux session 中运行 ducc，方便实时查看执行过程
+  tmux 模式会自动激活 conda 环境（默认: dejavu），也可通过 --conda-env 指定
   
 推荐工作流程:
   1. 快速生成 patches (不验证):
      python test_tmux_cc_experience.py --max-tasks 2 --no-validate
      
   2. tmux 模式运行 (可实时查看):
+     # 方式 A: 已激活环境（推荐）
+     conda activate dejavu
      python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
+     
+     # 方式 B: 使用默认环境（自动激活 dejavu）
+     python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
+     
+     # 方式 C: 指定其他环境
+     python test_tmux_cc_experience.py --index 0 --use-tmux --conda-env myenv --no-validate
+     
      # 在另一个终端查看: tmux attach -t swe_bench_<instance_id>
      
   3. 完整评估 (包含验证):
@@ -1075,6 +1425,7 @@ def main():
      
   4. 查看结果:
      cat swe_bench_output_ducc/report.json
+     ls -la swe_bench_output_ducc/tasks/<instance_id>/
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1084,11 +1435,19 @@ def main():
                        help='跳过验证 (默认启用验证)')
     parser.add_argument('--use-tmux', action='store_true',
                        help='使用 tmux 模式运行 ducc (可通过 tmux attach 查看实时执行)')
+    parser.add_argument('--conda-env', type=str, default='dejavu',
+                       help='tmux 模式下使用的 conda 环境名称 (默认: dejavu)')
     parser.add_argument('--output-dir', default='./swe_bench_output_ducc', help='输出目录')
     args = parser.parse_args()
     
     global ENABLE_VALIDATION
     ENABLE_VALIDATION = not args.no_validate
+    
+    # 设置默认 conda 环境（如果未设置 CONDA_DEFAULT_ENV）
+    if args.use_tmux and args.conda_env:
+        if not os.environ.get('CONDA_DEFAULT_ENV'):
+            os.environ['DEFAULT_CONDA_ENV'] = args.conda_env
+            print(f"💡 将使用默认 conda 环境: {args.conda_env}")
     
     if args.index is None and not args.max_tasks:
         parser.error("必须指定 --index 或 --max-tasks")
@@ -1143,7 +1502,7 @@ def main():
             print(f"{'='*70}")
             
             try:
-                result = evaluator.evaluate_single(instance)
+                result = evaluator.evaluate_single(instance, output_dir=args.output_dir)
                 results.append(result)
                 save_result(result, args.output_dir)
             except Exception as e:
