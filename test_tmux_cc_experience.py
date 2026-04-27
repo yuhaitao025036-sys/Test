@@ -103,14 +103,124 @@ def find_ducc_binary() -> str:
 class SimpleDuccEvaluator:
     """简化的 DUCC 评估器 - 完全独立"""
     
-    def __init__(self, use_tmux=False):
+    def __init__(self, use_tmux=False, timeout=600):
         self.docker_client = None
         self._container_cache = {}
         self.ducc_bin = find_ducc_binary()
         self.use_tmux = use_tmux
+        self.timeout = timeout
         
     def __del__(self):
         self.cleanup()
+    
+    def _copy_claude_session_trace(self, workspace: str, task_dir: str, start_time: float):
+        """查找并复制 Claude/ducc 的 session 轨迹到任务目录
+        
+        Args:
+            workspace: ducc 运行的工作目录
+            task_dir: 任务目录
+            start_time: 任务开始时间（用于过滤最近的 session）
+        """
+        try:
+            import glob
+            
+            # Claude session 保存在 ~/.claude/projects/ 下
+            claude_projects_dir = os.path.expanduser("~/.claude/projects")
+            if not os.path.exists(claude_projects_dir):
+                print(f"  ⚠️  未找到 Claude projects 目录: {claude_projects_dir}")
+                return
+            
+            # 根据 workspace 路径生成 project hash（简化版：查找包含相关路径的目录）
+            workspace_basename = os.path.basename(workspace)
+            
+            # 查找最近创建/修改的 session 文件（在任务开始时间之后）
+            all_sessions = []
+            for project_dir in glob.glob(os.path.join(claude_projects_dir, "*")):
+                if not os.path.isdir(project_dir):
+                    continue
+                
+                for session_file in glob.glob(os.path.join(project_dir, "*.jsonl")):
+                    # 检查文件修改时间是否在任务时间范围内
+                    file_mtime = os.path.getmtime(session_file)
+                    # 允许一些时间误差（前后5分钟）
+                    if file_mtime >= start_time - 300 and file_mtime <= time.time() + 60:
+                        all_sessions.append({
+                            'path': session_file,
+                            'mtime': file_mtime,
+                            'size': os.path.getsize(session_file),
+                            'project_dir': project_dir
+                        })
+            
+            if not all_sessions:
+                print(f"  ⚠️  未找到对应的 Claude session（时间范围: {time.strftime('%H:%M:%S', time.localtime(start_time))} - 现在）")
+                return
+            
+            # 按修改时间排序，取最近的一个
+            all_sessions.sort(key=lambda x: x['mtime'], reverse=True)
+            latest_session = all_sessions[0]
+            
+            # 复制到任务目录
+            session_dest = os.path.join(task_dir, 'claude_session.jsonl')
+            shutil.copy2(latest_session['path'], session_dest)
+            
+            # 也保存 session 元信息
+            session_info = {
+                'original_path': latest_session['path'],
+                'project_dir': latest_session['project_dir'],
+                'modified_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(latest_session['mtime'])),
+                'file_size_bytes': latest_session['size'],
+                'workspace': workspace,
+            }
+            
+            session_info_file = os.path.join(task_dir, 'claude_session_info.json')
+            with open(session_info_file, 'w', encoding='utf-8') as f:
+                json.dump(session_info, f, indent=2)
+            
+            print(f"  ✓ Claude session 轨迹已复制: claude_session.jsonl")
+            print(f"    原始位置: {latest_session['path']}")
+            print(f"    文件大小: {latest_session['size']/1024:.1f} KB")
+            
+            # 生成可读的摘要
+            try:
+                summary_lines = []
+                with open(session_dest, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line)
+                            event_type = event.get('type', 'unknown')
+                            summary_lines.append(event_type)
+                        except:
+                            continue
+                
+                # 统计事件类型
+                from collections import Counter
+                event_counts = Counter(summary_lines)
+                
+                summary_file = os.path.join(task_dir, 'claude_session_summary.txt')
+                with open(summary_file, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write("Claude Session 轨迹摘要\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(f"Session 文件: claude_session.jsonl\n")
+                    f.write(f"总事件数: {len(summary_lines)}\n\n")
+                    f.write("事件类型统计:\n")
+                    for event_type, count in event_counts.most_common():
+                        f.write(f"  {event_type:20s}: {count:5d}\n")
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write("查看完整轨迹:\n")
+                    f.write("  cat claude_session.jsonl | jq\n")
+                    f.write("  cat claude_session.jsonl | jq -r '.type' | sort | uniq -c\n")
+                    f.write("  cat claude_session.jsonl | jq 'select(.type==\"tool_use\")'\n")
+                
+                print(f"  ✓ Session 摘要已生成: claude_session_summary.txt")
+                
+            except Exception as e:
+                print(f"  ⚠️  生成 session 摘要失败: {e}")
+            
+        except Exception as e:
+            print(f"  ⚠️  复制 Claude session 失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def cleanup(self):
         """清理所有容器"""
@@ -378,54 +488,119 @@ class SimpleDuccEvaluator:
         
         # 准备日志文件
         log_file = None
+        debug_file = None
         if task_dir:
             log_file = os.path.join(task_dir, 'ducc_execution.log')
+            debug_file = os.path.join(task_dir, 'ducc_debug.log')
+            # 添加 --debug-file 参数，保存详细的调试信息
+            cmd.extend(["--debug-file", debug_file])
+            print(f"  Debug 日志: {debug_file}")
         
         try:
             print(f"  开始时间: {time.strftime('%H:%M:%S')}")
             start_time = time.time()
             
-            result = subprocess.run(
-                cmd,
-                cwd=workspace,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                input='y\n' * 100,
-            )
+            # ✨ 改进：实时保存日志，防止中途崩溃丢失
+            if log_file:
+                # 预先写入日志头
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write("DUCC 执行日志（实时保存）\n")
+                    f.write("=" * 80 + "\n")
+                    f.write(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+                    f.write(f"工作目录: {workspace}\n")
+                    f.write(f"命令: {' '.join(cmd)}\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write("执行中...\n\n")
+                
+                # 使用 tee 方式实时保存：同时捕获到变量和文件
+                stdout_file = log_file + '.stdout.tmp'
+                stderr_file = log_file + '.stderr.tmp'
+                
+                with open(stdout_file, 'w', encoding='utf-8') as stdout_f, \
+                     open(stderr_file, 'w', encoding='utf-8') as stderr_f:
+                    
+                    process = subprocess.Popen(
+                        cmd,
+                        cwd=workspace,
+                        env=env,
+                        stdout=stdout_f,
+                        stderr=stderr_f,
+                        stdin=subprocess.PIPE,
+                        text=True,
+                    )
+                    
+                    # 发送自动确认输入
+                    try:
+                        process.stdin.write('y\n' * 100)
+                        process.stdin.flush()
+                        process.stdin.close()
+                    except:
+                        pass
+                    
+                    # 等待完成或超时
+                    try:
+                        process.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                        print(f"  ✗ 超时 ({timeout}秒)")
+                
+                # 读取输出
+                with open(stdout_file, 'r', encoding='utf-8') as f:
+                    stdout = f.read()
+                with open(stderr_file, 'r', encoding='utf-8') as f:
+                    stderr = f.read()
+                
+                # 合并到最终日志文件
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write("STDOUT:\n")
+                    f.write("-" * 80 + "\n")
+                    f.write(stdout)
+                    f.write("\n" + "-" * 80 + "\n\n")
+                    f.write("STDERR:\n")
+                    f.write("-" * 80 + "\n")
+                    f.write(stderr)
+                    f.write("\n" + "-" * 80 + "\n\n")
+                    duration = time.time() - start_time
+                    f.write(f"结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"执行耗时: {duration:.2f}秒\n")
+                    f.write(f"退出码: {process.returncode}\n")
+                
+                # 删除临时文件
+                try:
+                    os.remove(stdout_file)
+                    os.remove(stderr_file)
+                except:
+                    pass
+                
+                print(f"  ✓ 执行日志已实时保存: {log_file}")
+                
+                # 创建 result 对象模拟 subprocess.run 返回值
+                class Result:
+                    def __init__(self, returncode, stdout, stderr):
+                        self.returncode = returncode
+                        self.stdout = stdout
+                        self.stderr = stderr
+                
+                result = Result(process.returncode, stdout, stderr)
+                
+            else:
+                # 没有日志文件，使用原来的简单方式
+                result = subprocess.run(
+                    cmd,
+                    cwd=workspace,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout,
+                    input='y\n' * 100,
+                )
             
             duration = time.time() - start_time
             print(f"  完成时间: {time.strftime('%H:%M:%S')}")
             print(f"  执行耗时: {duration:.2f}秒")
-            
-            # 保存完整输出到日志文件
-            if log_file:
-                try:
-                    with open(log_file, 'w', encoding='utf-8') as f:
-                        f.write("=" * 80 + "\n")
-                        f.write("DUCC 执行日志\n")
-                        f.write("=" * 80 + "\n")
-                        f.write(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
-                        f.write(f"结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        f.write(f"执行耗时: {duration:.2f}秒\n")
-                        f.write(f"退出码: {result.returncode}\n")
-                        f.write(f"工作目录: {workspace}\n")
-                        f.write("=" * 80 + "\n\n")
-                        
-                        f.write("STDOUT:\n")
-                        f.write("-" * 80 + "\n")
-                        f.write(result.stdout)
-                        f.write("\n" + "-" * 80 + "\n\n")
-                        
-                        f.write("STDERR:\n")
-                        f.write("-" * 80 + "\n")
-                        f.write(result.stderr)
-                        f.write("\n" + "-" * 80 + "\n")
-                    print(f"  ✓ 执行日志已保存: {log_file}")
-                except Exception as e:
-                    print(f"  ⚠️  保存日志失败: {e}")
             
             if result.returncode != 0:
                 print(f"⚠️  ducc 返回非零退出码: {result.returncode}")
@@ -556,7 +731,19 @@ class SimpleDuccEvaluator:
             
             # 3. 构建ducc命令
             permission_mode = "bypassPermissions" if os.geteuid() != 0 else "default"
-            ducc_cmd = f'IS_SANDBOX=1 {self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write" --effort low'
+            
+            # 准备 debug 日志文件
+            debug_file = None
+            if task_dir:
+                debug_file = os.path.join(task_dir, 'ducc_debug.log')
+            
+            # 注意：不使用 --effort low，保持与直接模式一致的思考深度
+            ducc_cmd = f'IS_SANDBOX=1 {self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write"'
+            
+            # ✨ 修复：Tmux 模式也添加 --debug-file
+            if debug_file:
+                ducc_cmd += f' --debug-file "{debug_file}"'
+                print(f"  Debug 日志将保存到: {debug_file}")
             
             # 4. 在tmux中启动ducc
             subprocess.run(
@@ -574,31 +761,78 @@ class SimpleDuccEvaluator:
                 "Yes, I trust this folder": "Enter",
                 "allow all edits during this session": "Down Enter",
                 "Press Enter to continue": "Enter",
+                "Yes, I accept": "Down Enter",  # Bypass Permissions 警告
+                "No, exit": "Down Enter",  # 同上，默认是 No，需要 Down 到 Yes
+                "Pasted text": "Enter",  # ✨ 修复：自动确认粘贴文本提示
             }
             
-            for _ in range(10):
+            # 循环检查并确认提示，即使没检测到也继续等待
+            print(f"  检查并自动确认提示...")
+            for i in range(10):
                 content = self._tmux_capture_pane(session_name)
+                # ✨ 关键修复：清理 ANSI 转义序列
+                import re
+                ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+                clean_content = ansi_escape.sub('', content)
+                
                 confirmed = False
                 for pattern, keys in auto_confirm_patterns.items():
-                    if pattern in content:
-                        print(f"  检测到提示: {pattern}, 自动确认")
+                    if pattern in clean_content:  # ← 在清理后的内容中检测
+                        print(f"  检测到提示: '{pattern}', 自动发送: {keys}")
                         for key in keys.split():
                             subprocess.run(["tmux", "send-keys", "-t", session_name, key])
                         confirmed = True
+                        time.sleep(1)  # 确认后等待一下
                         break
-                if not confirmed:
-                    break
+                if confirmed:
+                    # 确认后再检查一次是否还有其他提示
+                    continue
+                # 没有检测到提示，继续等待
                 time.sleep(1)
             
             # 7. 等待ducc就绪
             time.sleep(2)
             
-            # 8. 发送prompt
+            # 8. 发送prompt（使用 tmux buffer 避免 bracketed paste 问题）
             print(f"✓ 发送任务prompt")
-            subprocess.run(
-                ["tmux", "send-keys", "-t", session_name, prompt, "Enter"],
-                check=True
-            )
+            
+            # 方法1: 尝试使用 tmux buffer（避免 bracketed paste）
+            try:
+                # 将 prompt 加载到 tmux buffer
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+                    f.write(prompt)
+                    prompt_tmp_file = f.name
+                
+                # 加载到 buffer 并粘贴
+                subprocess.run(
+                    ["tmux", "load-buffer", prompt_tmp_file],
+                    check=True
+                )
+                subprocess.run(
+                    ["tmux", "paste-buffer", "-t", session_name],
+                    check=True
+                )
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                    check=True
+                )
+                
+                # 清理临时文件
+                try:
+                    os.remove(prompt_tmp_file)
+                except:
+                    pass
+                
+                print(f"  ✓ Prompt 已通过 tmux buffer 发送")
+                
+            except Exception as e:
+                # 回退到直接发送（可能触发 bracketed paste）
+                print(f"  ⚠️  tmux buffer 方式失败，回退到直接发送: {e}")
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, prompt, "Enter"],
+                    check=True
+                )
             
             # 9. 监控执行直到完成
             print(f"✓ 开始监控执行...")
@@ -630,20 +864,36 @@ class SimpleDuccEvaluator:
                     print(f"  ⚠️  保存日志失败: {e}")
             
             print(f"\n✓ 任务执行完成 (耗时: {duration:.2f}秒)")
-            print(f"  Session保持活跃: tmux attach -t {session_name}")
-            print(f"  关闭session: tmux kill-session -t {session_name}")
+            
+            # 自动关闭tmux session以防止批量运行时session堆积
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", session_name],
+                    check=False,  # 即使失败也不影响结果
+                    capture_output=True
+                )
+                print(f"  ✓ Tmux session已关闭: {session_name}")
+            except Exception as e:
+                print(f"  ⚠ 无法关闭tmux session: {e}")
             
             return output
             
         except subprocess.CalledProcessError as e:
             print(f"✗ tmux命令执行失败: {e}")
+            # 清理失败的session
+            try:
+                subprocess.run(["tmux", "kill-session", "-t", session_name], check=False, capture_output=True)
+            except:
+                pass
             return ""
         except Exception as e:
             print(f"✗ tmux模式执行失败: {e}")
+            # 清理失败的session
+            try:
+                subprocess.run(["tmux", "kill-session", "-t", session_name], check=False, capture_output=True)
+            except:
+                pass
             return ""
-        finally:
-            # 注意: 不自动关闭session，方便用户查看结果
-            pass
     
     def _tmux_capture_pane(self, session_name: str) -> str:
         """捕获tmux pane内容"""
@@ -664,6 +914,17 @@ class SimpleDuccEvaluator:
         
         # ANSI转义序列清理
         ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+        
+        # 自动确认模式
+        auto_confirm_patterns = {
+            "Do you want to proceed": "Enter",
+            "Yes, I trust this folder": "Enter",
+            "allow all edits during this session": "Down Enter",
+            "Press Enter to continue": "Enter",
+            "Yes, I accept": "Down Enter",
+            "No, exit": "Down Enter",
+            "Pasted text": "Enter",  # ✨ 修复：自动确认粘贴文本提示
+        }
         
         start_time = time.time()
         last_content = ""
@@ -687,6 +948,18 @@ class SimpleDuccEvaluator:
             # 捕获当前内容
             content = self._tmux_capture_pane(session_name)
             clean_content = ansi_escape.sub('', content)
+            
+            # ✨ 自动确认提示（在整个等待过程中持续检查）
+            for pattern, keys in auto_confirm_patterns.items():
+                if pattern in clean_content:
+                    print(f"  检测到提示: '{pattern}', 自动发送: {keys}")
+                    for key in keys.split():
+                        subprocess.run(["tmux", "send-keys", "-t", session_name, key])
+                    time.sleep(1)
+                    # 重置状态，重新开始检测
+                    last_content = ""
+                    idle_count = 0
+                    continue
             
             # 检测任务是否开始
             if not task_started:
@@ -744,8 +1017,10 @@ class SimpleDuccEvaluator:
             
             time.sleep(check_interval)
         
-        # 返回最终内容
-        return self._tmux_capture_pane(session_name)
+        # 返回最终内容（清理 ANSI 转义序列）
+        final_content = self._tmux_capture_pane(session_name)
+        clean_final_content = ansi_escape.sub('', final_content)
+        return clean_final_content
     
     def _save_task_summary(self, task_dir: str, result: Dict, start_time: float):
         """保存任务执行摘要"""
@@ -816,14 +1091,36 @@ class SimpleDuccEvaluator:
                 f.write("\n" + "=" * 80 + "\n")
                 f.write("文件说明:\n")
                 f.write("=" * 80 + "\n")
-                f.write("  dataset_info.json      - 数据集原始信息\n")
-                f.write("  prompt.txt             - 发送给 ducc 的 prompt\n")
-                f.write("  ducc_execution.log     - ducc 执行日志（含stdout/stderr）\n")
-                f.write("  ducc_raw_output.txt    - ducc 原始输出\n")
-                f.write("  extracted_patch.diff   - 提取的 patch\n")
-                f.write("  validation_result.json - 验证结果详情\n")
-                f.write("  task_summary.json      - 任务摘要（JSON格式）\n")
-                f.write("  README.txt             - 本文件（文本摘要）\n")
+                f.write("  dataset_info.json         - 数据集原始信息\n")
+                f.write("  prompt.txt                - 发送给 ducc 的 prompt\n")
+                f.write("  ducc_execution.log        - ducc 执行日志（含stdout/stderr）\n")
+                f.write("  ducc_debug.log            - ducc 详细调试日志（API调用、工具使用等）\n")
+                f.write("  ducc_raw_output.txt       - ducc 原始输出\n")
+                f.write("  claude_session.jsonl      - ✨ Claude 完整 session 轨迹（一对一）\n")
+                f.write("  claude_session_info.json  - ✨ Session 元信息（原始路径等）\n")
+                f.write("  claude_session_summary.txt- ✨ Session 轨迹摘要（事件统计）\n")
+                f.write("  extracted_patch.diff      - 提取的 patch\n")
+                f.write("  validation_result.json    - 验证结果详情\n")
+                f.write("  task_summary.json         - 任务摘要（JSON格式）\n")
+                f.write("  README.txt                - 本文件（文本摘要）\n")
+                f.write("\n")
+                f.write("=" * 80 + "\n")
+                f.write("查看 Claude session 轨迹:\n")
+                f.write("=" * 80 + "\n")
+                f.write("  # 查看完整轨迹（JSON Lines 格式）\n")
+                f.write("  cat claude_session.jsonl | jq\n")
+                f.write("\n")
+                f.write("  # 查看事件类型统计\n")
+                f.write("  cat claude_session.jsonl | jq -r '.type' | sort | uniq -c\n")
+                f.write("\n")
+                f.write("  # 只看工具调用\n")
+                f.write("  cat claude_session.jsonl | jq 'select(.type==\"tool_use\")'\n")
+                f.write("\n")
+                f.write("  # 只看 AI 思考过程\n")
+                f.write("  cat claude_session.jsonl | jq -r 'select(.type==\"thinking\") | .content'\n")
+                f.write("\n")
+                f.write("  # 查看对话流程\n")
+                f.write("  cat claude_session.jsonl | jq -r '{type: .type, time: .timestamp}'\n")
                 
             print(f"✓ 文本摘要已保存: {summary_text_file}")
             
@@ -881,7 +1178,8 @@ class SimpleDuccEvaluator:
             # 3. 调用 ducc (agent 在 workspace 目录操作)
             output = self.call_ducc(
                 prompt, 
-                workspace, 
+                workspace,
+                timeout=self.timeout,
                 use_tmux=self.use_tmux, 
                 instance_id=instance_id,
                 task_dir=task_dir
@@ -895,6 +1193,10 @@ class SimpleDuccEvaluator:
                 print(f"✓ Ducc 原始输出已保存: {raw_output_file}")
             except Exception as e:
                 print(f"⚠️  保存原始输出失败: {e}")
+            
+            # 复制 Claude session 轨迹到任务目录
+            print("\n正在复制 Claude session 轨迹...")
+            self._copy_claude_session_trace(workspace, task_dir, start_time)
             
             if not output:
                 error_result = {
@@ -1404,39 +1706,49 @@ def main():
   tmux 模式会自动激活 conda 环境（默认: dejavu），也可通过 --conda-env 指定
   
 推荐工作流程:
-  1. 快速生成 patches (不验证):
-     python test_tmux_cc_experience.py --max-tasks 2 --no-validate
+  1. 单个任务测试:
+     python test_tmux_cc_experience.py --index 0 --no-validate
+  
+  2. 批量处理（前N个任务）:
+     python test_tmux_cc_experience.py --max-tasks 10 --no-validate
+  
+  3. 指定范围处理（适合分批次运行）:
+     # 第一批: 处理 0-50
+     python test_tmux_cc_experience.py --start-index 0 --end-index 50 --no-validate
      
-  2. tmux 模式运行 (可实时查看):
-     # 方式 A: 已激活环境（推荐）
-     conda activate dejavu
+     # 第二批: 处理 50-100
+     python test_tmux_cc_experience.py --start-index 50 --end-index 100 --no-validate
+     
+     # 第三批: 处理 100-150
+     python test_tmux_cc_experience.py --start-index 100 --end-index 150 --no-validate
+  
+  4. tmux 模式（可实时查看）:
+     # 单个任务
      python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
-     
-     # 方式 B: 使用默认环境（自动激活 dejavu）
-     python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
-     
-     # 方式 C: 指定其他环境
-     python test_tmux_cc_experience.py --index 0 --use-tmux --conda-env myenv --no-validate
      
      # 在另一个终端查看: tmux attach -t swe_bench_<instance_id>
      
-  3. 完整评估 (包含验证):
-     python test_tmux_cc_experience.py --max-tasks 2 --use-tmux
-     
-  4. 查看结果:
+     # 指定 conda 环境
+     python test_tmux_cc_experience.py --index 0 --use-tmux --conda-env myenv
+  
+  5. 查看结果:
      cat swe_bench_output_ducc/report.json
      ls -la swe_bench_output_ducc/tasks/<instance_id>/
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--index', type=int, help='任务索引')
-    parser.add_argument('--max-tasks', type=int, help='最多处理 N 个任务')
+    parser.add_argument('--index', type=int, help='任务索引（单个任务）')
+    parser.add_argument('--max-tasks', type=int, help='最多处理 N 个任务（从索引0开始）')
+    parser.add_argument('--start-index', type=int, help='起始索引（包含，配合 --end-index 使用）')
+    parser.add_argument('--end-index', type=int, help='结束索引（不包含，配合 --start-index 使用）')
     parser.add_argument('--no-validate', action='store_true', 
                        help='跳过验证 (默认启用验证)')
     parser.add_argument('--use-tmux', action='store_true',
                        help='使用 tmux 模式运行 ducc (可通过 tmux attach 查看实时执行)')
     parser.add_argument('--conda-env', type=str, default='dejavu',
                        help='tmux 模式下使用的 conda 环境名称 (默认: dejavu)')
+    parser.add_argument('--timeout', type=int, default=600,
+                       help='ducc 执行超时时间（秒），默认 600 (10分钟)')
     parser.add_argument('--output-dir', default='./swe_bench_output_ducc', help='输出目录')
     args = parser.parse_args()
     
@@ -1449,8 +1761,22 @@ def main():
             os.environ['DEFAULT_CONDA_ENV'] = args.conda_env
             print(f"💡 将使用默认 conda 环境: {args.conda_env}")
     
-    if args.index is None and not args.max_tasks:
-        parser.error("必须指定 --index 或 --max-tasks")
+    # 参数验证
+    if args.index is None and not args.max_tasks and not (args.start_index is not None and args.end_index is not None):
+        parser.error("必须指定以下之一:\n"
+                    "  --index <N>                    (单个任务)\n"
+                    "  --max-tasks <N>                (前 N 个任务，从0开始)\n"
+                    "  --start-index <N> --end-index <M>  (任务范围 [N, M))")
+    
+    # 检查参数冲突
+    if args.index is not None and (args.max_tasks or args.start_index is not None or args.end_index is not None):
+        parser.error("--index 不能与 --max-tasks, --start-index, --end-index 同时使用")
+    
+    if args.max_tasks and (args.start_index is not None or args.end_index is not None):
+        parser.error("--max-tasks 不能与 --start-index, --end-index 同时使用")
+    
+    if (args.start_index is not None) != (args.end_index is not None):
+        parser.error("--start-index 和 --end-index 必须同时指定")
     
     # 检查输出目录
     if os.path.exists(args.output_dir):
@@ -1480,19 +1806,41 @@ def main():
         print("💡 提示: 使用 'tmux attach -t swe_bench_<instance_id>' 查看实时执行")
     print()
     
-    evaluator = SimpleDuccEvaluator(use_tmux=args.use_tmux)
+    evaluator = SimpleDuccEvaluator(use_tmux=args.use_tmux, timeout=args.timeout)
     
     try:
         dataset = evaluator.load_dataset()
         
         # 选择任务
         if args.index is not None:
+            # 单个任务
             instances = [dataset[args.index]]
+            print(f"\n处理单个任务: 索引 {args.index}")
+        elif args.start_index is not None and args.end_index is not None:
+            # 范围选择
+            start = args.start_index
+            end = args.end_index
+            
+            # 验证范围
+            if start < 0:
+                parser.error(f"--start-index 必须 >= 0，当前: {start}")
+            if end > len(dataset):
+                print(f"⚠️  --end-index ({end}) 超过数据集大小 ({len(dataset)})，将调整为 {len(dataset)}")
+                end = len(dataset)
+            if start >= end:
+                parser.error(f"--start-index ({start}) 必须小于 --end-index ({end})")
+            
+            instances = [dataset[i] for i in range(start, end)]
+            print(f"\n处理任务范围: [{start}, {end}) (共 {len(instances)} 个任务)")
+            print(f"  起始: {instances[0]['instance_id']}")
+            print(f"  结束: {instances[-1]['instance_id']}")
         else:
+            # max_tasks: 从 0 开始
             max_tasks = min(args.max_tasks, len(dataset))
             instances = [dataset[i] for i in range(max_tasks)]
+            print(f"\n处理前 {max_tasks} 个任务 (索引 0-{max_tasks-1})")
         
-        print(f"\n将处理 {len(instances)} 个任务")
+        print(f"总共将处理 {len(instances)} 个任务")
         
         # 处理
         results = []
