@@ -318,6 +318,7 @@ class SimpleDuccEvaluator:
         print(f"  二进制: {self.ducc_bin}")
         print(f"  工作目录: {workspace}")
         print(f"  超时设置: {timeout}秒")
+        print(f"  prompt: {prompt}")
         
         # 构建命令
         cmd = [
