@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SWE-bench Pro 评测 - DUCC 独立版本
+SWE-bench Pro 评测 - DUCC 独立版本 (支持 tmux 模式)
 
 完全不依赖 Experience 框架,直接调用 ducc
 
@@ -10,19 +10,23 @@ SWE-bench Pro 评测 - DUCC 独立版本
 
 工作流程:
   1. 从 Docker 容器提取完整代码库
-  2. 调用 ducc agent 生成修复 patch  
+  2. 调用 ducc agent 生成修复 patch (支持直接模式和tmux模式)
   3. 保存 patch 为标准格式
   4. (可选) 在容器内验证: git apply + pytest
 
 用法:
-  # 单个任务 + 验证
-  python test_ducc_standalone.py --index 0 --validate
+  # 直接模式 - 单个任务 + 验证
+  python test_tmux_cc_experience.py --index 0 --validate
+  
+  # tmux 模式 - 可实时查看执行过程
+  python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
+  # 然后在另一个终端: tmux attach -t swe_bench_<instance_id>
   
   # 批量处理 (不验证,快速生成patches)
-  python test_ducc_standalone.py --max-tasks 10
+  python test_tmux_cc_experience.py --max-tasks 2 --no-validate
   
-  # 批量处理 + 验证
-  python test_ducc_standalone.py --max-tasks 10 --validate
+  # 批量处理 + 验证 + tmux模式
+  python test_tmux_cc_experience.py --max-tasks 2 --use-tmux
 """
 
 # python convert_to_hf_dataset.py --input /ssd1/Dejavu/datasets/SWE-bench_Pro/test-00000-of-00001.parquet   --output ./swebench_dataset_local
@@ -99,10 +103,11 @@ def find_ducc_binary() -> str:
 class SimpleDuccEvaluator:
     """简化的 DUCC 评估器 - 完全独立"""
     
-    def __init__(self):
+    def __init__(self, use_tmux=False):
         self.docker_client = None
         self._container_cache = {}
         self.ducc_bin = find_ducc_binary()
+        self.use_tmux = use_tmux
         
     def __del__(self):
         self.cleanup()
@@ -306,20 +311,32 @@ class SimpleDuccEvaluator:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
     
-    def call_ducc(self, prompt: str, workspace: str, timeout: int = 600) -> str:
-        """直接调用 ducc
+    def call_ducc(self, prompt: str, workspace: str, timeout: int = 600, use_tmux: bool = False, instance_id: str = "") -> str:
+        """调用 ducc - 支持直接调用和tmux模式
         
         Args:
             prompt: 任务描述
             workspace: 工作目录
             timeout: 超时时间（秒），默认600秒（10分钟）
+            use_tmux: 是否使用tmux模式运行
+            instance_id: 任务ID，用于生成tmux session名称
         """
         print(f"\n正在调用 ducc...")
         print(f"  二进制: {self.ducc_bin}")
         print(f"  工作目录: {workspace}")
         print(f"  超时设置: {timeout}秒")
-        print(f"  prompt: {prompt}")
+        print(f"  运行模式: {'tmux模式' if use_tmux else '直接模式'}")
+        print(f"  prompt: {prompt[:200]}..." if len(prompt) > 200 else f"  prompt: {prompt}")
         
+        if use_tmux:
+            # 使用tmux模式
+            return self._call_ducc_tmux(prompt, workspace, timeout, instance_id)
+        else:
+            # 直接调用模式（原有逻辑）
+            return self._call_ducc_direct(prompt, workspace, timeout)
+    
+    def _call_ducc_direct(self, prompt: str, workspace: str, timeout: int) -> str:
+        """直接调用 ducc（原有实现）"""
         # 构建命令
         cmd = [
             self.ducc_bin,
@@ -328,49 +345,39 @@ class SimpleDuccEvaluator:
         ]
         
         # 权限模式: 尽量自动批准,避免等待确认
-        # 检查 ducc 是否支持 --auto-approve 或类似参数
         if os.geteuid() != 0:
-            # 非 root: 使用 bypassPermissions
             cmd.extend(["--permission-mode", "bypassPermissions"])
             print("  权限模式: bypassPermissions (自动批准)")
         else:
-            # root 用户不能用 bypassPermissions
-            # 方案 1: 设置环境变量强制非交互
             print("  权限模式: 默认 (root 用户)")
             print("  ⚠️  注意: 如果 ducc 询问确认,可能会超时")
         
         # 准备环境变量(强制非交互模式)
         env = os.environ.copy()
-        env['DUCC_AUTO_APPROVE'] = '1'  # 如果 ducc 支持这个环境变量
-        env['CI'] = 'true'               # 很多工具检测 CI 环境会跳过交互
+        env['DUCC_AUTO_APPROVE'] = '1'
+        env['CI'] = 'true'
         
         try:
-            # 执行 ducc
             print(f"  开始时间: {time.strftime('%H:%M:%S')}")
             result = subprocess.run(
                 cmd,
                 cwd=workspace,
-                env=env,                    # ← 传递环境变量
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=timeout,
-                input='y\n' * 100,          # ← 预先输入100个 'y',自动确认 (会自动设置 stdin=PIPE)
+                input='y\n' * 100,
             )
             print(f"  完成时间: {time.strftime('%H:%M:%S')}")
             
             if result.returncode != 0:
                 print(f"⚠️  ducc 返回非零退出码: {result.returncode}")
                 print(f"stderr: {result.stderr[:500]}")
-                # 即使失败也返回 stdout,可能有部分输出
             
             output = result.stdout
             if not output and result.returncode != 0:
                 print(f"✗ ducc 执行失败且无输出")
-                print(f"  可能原因:")
-                print(f"    1. 缺少语言环境 (如 node, python, go 等)")
-                print(f"    2. ducc 崩溃或权限问题")
-                print(f"    3. 工作目录问题")
             else:
                 print(f"✓ ducc 执行完成,输出长度: {len(output)} 字符")
             
@@ -378,15 +385,200 @@ class SimpleDuccEvaluator:
         
         except subprocess.TimeoutExpired:
             print(f"✗ ducc 执行超时 ({timeout}秒 = {timeout//60}分钟)")
-            print(f"  可能原因:")
-            print(f"    1. DUCC 在等待用户输入")
-            print(f"    2. 任务过于复杂")
-            print(f"    3. 某个子进程卡住")
-            print(f"  建议: 增加 timeout 参数或检查 DUCC 日志")
             return ""
         except Exception as e:
             print(f"✗ ducc 执行失败: {e}")
             return ""
+    
+    def _call_ducc_tmux(self, prompt: str, workspace: str, timeout: int, instance_id: str) -> str:
+        """使用tmux模式调用 ducc"""
+        import re
+        
+        # 生成tmux session名称
+        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', instance_id)
+        session_name = f"swe_bench_{safe_id}_{int(time.time())}"
+        
+        print(f"\n{'='*60}")
+        print(f"启动 tmux session: {session_name}")
+        print(f"工作目录: {workspace}")
+        print(f"查看执行过程: tmux attach -t {session_name}")
+        print(f"{'='*60}\n")
+        
+        try:
+            # 1. 创建tmux session
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", session_name, "-c", workspace],
+                check=True
+            )
+            print(f"✓ tmux session 已创建")
+            
+            # 2. 构建ducc命令
+            permission_mode = "bypassPermissions" if os.geteuid() != 0 else "default"
+            ducc_cmd = f'IS_SANDBOX=1 {self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write" --effort low'
+            
+            # 3. 在tmux中启动ducc
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, ducc_cmd, "Enter"],
+                check=True
+            )
+            print(f"✓ ducc 命令已发送")
+            
+            # 4. 等待ducc启动
+            time.sleep(3)
+            
+            # 5. 自动确认trust folder等提示
+            auto_confirm_patterns = {
+                "Do you want to proceed": "Enter",
+                "Yes, I trust this folder": "Enter",
+                "allow all edits during this session": "Down Enter",
+                "Press Enter to continue": "Enter",
+            }
+            
+            for _ in range(10):
+                content = self._tmux_capture_pane(session_name)
+                confirmed = False
+                for pattern, keys in auto_confirm_patterns.items():
+                    if pattern in content:
+                        print(f"  检测到提示: {pattern}, 自动确认")
+                        for key in keys.split():
+                            subprocess.run(["tmux", "send-keys", "-t", session_name, key])
+                        confirmed = True
+                        break
+                if not confirmed:
+                    break
+                time.sleep(1)
+            
+            # 6. 等待ducc就绪
+            time.sleep(2)
+            
+            # 7. 发送prompt
+            print(f"✓ 发送任务prompt")
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, prompt, "Enter"],
+                check=True
+            )
+            
+            # 8. 监控执行直到完成
+            print(f"✓ 开始监控执行...")
+            output = self._wait_for_ducc_completion(session_name, timeout)
+            
+            print(f"\n✓ 任务执行完成")
+            print(f"  Session保持活跃: tmux attach -t {session_name}")
+            print(f"  关闭session: tmux kill-session -t {session_name}")
+            
+            return output
+            
+        except subprocess.CalledProcessError as e:
+            print(f"✗ tmux命令执行失败: {e}")
+            return ""
+        except Exception as e:
+            print(f"✗ tmux模式执行失败: {e}")
+            return ""
+        finally:
+            # 注意: 不自动关闭session，方便用户查看结果
+            pass
+    
+    def _tmux_capture_pane(self, session_name: str) -> str:
+        """捕获tmux pane内容"""
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-e", "-S", "-", "-t", session_name],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout
+        except:
+            return ""
+    
+    def _wait_for_ducc_completion(self, session_name: str, timeout: int, check_interval: int = 3) -> str:
+        """等待ducc执行完成"""
+        import re
+        
+        # ANSI转义序列清理
+        ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+        
+        start_time = time.time()
+        last_content = ""
+        idle_count = 0
+        task_started = False
+        
+        while True:
+            if time.time() - start_time > timeout:
+                print(f"  ⚠️  达到超时时间 ({timeout}秒)")
+                break
+            
+            # 检查session是否还存在
+            result = subprocess.run(
+                ["tmux", "has-session", "-t", session_name],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                print(f"  Session已关闭")
+                break
+            
+            # 捕获当前内容
+            content = self._tmux_capture_pane(session_name)
+            clean_content = ansi_escape.sub('', content)
+            
+            # 检测任务是否开始
+            if not task_started:
+                task_indicators = ['Read(', 'Write(', 'Edit(', 'Thinking', 'Reading', 'Writing']
+                for indicator in task_indicators:
+                    if indicator in clean_content:
+                        task_started = True
+                        print(f"  ✓ 任务已开始 (检测到: {indicator})")
+                        break
+            
+            if not task_started:
+                print(f"  等待任务开始...")
+                time.sleep(check_interval)
+                continue
+            
+            # 检测是否仍在执行
+            still_working = any(
+                ind in clean_content
+                for ind in ['Thinking', 'Searching', 'Reading', 'Writing', 'Editing', 'Proofing']
+            )
+            
+            if still_working:
+                print(f"  ducc 正在工作...")
+                last_content = content
+                time.sleep(check_interval)
+                continue
+            
+            # 检测完成标志
+            lines = clean_content.strip().split('\n')
+            last_lines = '\n'.join(lines[-5:]) if len(lines) >= 5 else clean_content
+            
+            # 检测idle状态（❯ prompt）
+            is_idle = False
+            if '❯' in last_lines:
+                for line in lines[-3:]:
+                    stripped = line.strip()
+                    if stripped == '❯' or (stripped.endswith('❯') and len(stripped) < 5):
+                        is_idle = True
+                        break
+            
+            # 判断是否完成
+            if is_idle or 'Done.' in clean_content:
+                if content == last_content:
+                    idle_count += 1
+                    print(f"  屏幕无变化 ({idle_count}/3)")
+                    if idle_count >= 3:
+                        print(f"  ✓ 任务完成")
+                        break
+                else:
+                    idle_count = 0
+                    last_content = content
+            else:
+                idle_count = 0
+                last_content = content
+            
+            time.sleep(check_interval)
+        
+        # 返回最终内容
+        return self._tmux_capture_pane(session_name)
     
     def evaluate_single(self, instance: Dict) -> Dict:
         """评估单个任务"""
@@ -408,7 +600,7 @@ class SimpleDuccEvaluator:
             prompt = self._build_prompt(instance)
             
             # 3. 调用 ducc (agent 在 workspace 目录操作)
-            output = self.call_ducc(prompt, workspace)
+            output = self.call_ducc(prompt, workspace, use_tmux=self.use_tmux, instance_id=instance_id)
             
             if not output:
                 return {
@@ -861,20 +1053,27 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='SWE-bench Pro DUCC 评测 (无 Experience 依赖, 无官方评估工具支持)',
+        description='SWE-bench Pro DUCC 评测 (支持 tmux 实时查看, 无 Experience 依赖)',
         epilog="""
 说明:
   SWE-bench Pro 包含41个多语言仓库,官方 swebench.harness 不支持
   本脚本使用自己的验证逻辑 (在 Docker 容器内 git apply + 运行测试)
   
+  【tmux 模式说明】
+  使用 --use-tmux 参数可以在 tmux session 中运行 ducc，方便实时查看执行过程
+  
 推荐工作流程:
   1. 快速生成 patches (不验证):
-     python test_ducc_standalone.py --max-tasks 100
+     python test_tmux_cc_experience.py --max-tasks 2 --no-validate
      
-  2. 完整评估 (包含验证):
-     python test_ducc_standalone.py --max-tasks 100 --validate
+  2. tmux 模式运行 (可实时查看):
+     python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
+     # 在另一个终端查看: tmux attach -t swe_bench_<instance_id>
      
-  3. 查看结果:
+  3. 完整评估 (包含验证):
+     python test_tmux_cc_experience.py --max-tasks 2 --use-tmux
+     
+  4. 查看结果:
      cat swe_bench_output_ducc/report.json
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -883,6 +1082,8 @@ def main():
     parser.add_argument('--max-tasks', type=int, help='最多处理 N 个任务')
     parser.add_argument('--no-validate', action='store_true', 
                        help='跳过验证 (默认启用验证)')
+    parser.add_argument('--use-tmux', action='store_true',
+                       help='使用 tmux 模式运行 ducc (可通过 tmux attach 查看实时执行)')
     parser.add_argument('--output-dir', default='./swe_bench_output_ducc', help='输出目录')
     args = parser.parse_args()
     
@@ -912,12 +1113,15 @@ def main():
     print(f"使用模型: DUCC (独立版,无 Experience 依赖)")
     print(f"数据集: SWE-bench Pro (41 repos, 多语言)")
     print(f"输出目录: {args.output_dir}")
+    print(f"运行模式: {'tmux模式 (可实时查看)' if args.use_tmux else '直接模式'}")
     print(f"验证模式: {'启用' if ENABLE_VALIDATION else '禁用'}")
     if not ENABLE_VALIDATION:
         print("⚠️  跳过验证,只生成 patches")
+    if args.use_tmux:
+        print("💡 提示: 使用 'tmux attach -t swe_bench_<instance_id>' 查看实时执行")
     print()
     
-    evaluator = SimpleDuccEvaluator()
+    evaluator = SimpleDuccEvaluator(use_tmux=args.use_tmux)
     
     try:
         dataset = evaluator.load_dataset()
