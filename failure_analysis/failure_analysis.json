@@ -1,0 +1,181 @@
+{
+  "summary": {
+    "total_tasks": 64,
+    "successful_tasks": 50,
+    "failed_tasks": 14
+  },
+  "failure_categories": {
+    "disk_space": [
+      {
+        "index": 9,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-3fa6904377c006497169945428e8197158667910-v626ec2a48416b10a88641359a169d99e935ff037",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 13,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-c782838c3a174fdff80cafd8cd3b1aa4dae8beb2",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 19,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-6eaaf3a27e64f4ef4ef855bd35d7ec338cf17460-v626ec2a48416b10a88641359a169d99e935ff037",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 21,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-e6d86299a855687b21970504fbf06f52a8f80c74-vce94f93ad1030e3136852817f2423c1b3ac37bc4",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 26,
+        "project": "protonmail/webclients",
+        "task_id": "instance_protonmail__webclients-2c3559cad02d1090985dba7e8eb5a129144d9811",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 31,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-eefac60a350930e5f295f94a2d55b94c1988c04e-vee9b09fb20c43af7e520f57e9239bbcf46b7113d",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 38,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-0ac7334939981cf85b9591ac295c3816954e287e",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 39,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-b5d8169fc0a5e43fee2616c905c6d32164654dc6",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 42,
+        "project": "protonmail/webclients",
+        "task_id": "instance_protonmail__webclients-6dcf0d0b0f7965ad94be3f84971afeb437f25b02",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 47,
+        "project": "element",
+        "task_id": "instance_element-hq__element-web-72a8f8f03b1a01bb70ef8a5bb61759416991b32c-vnan",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 49,
+        "project": "gravitational/teleport",
+        "task_id": "instance_gravitational__teleport-3ff75e29fb2153a2637fe7f83e49dc04b1c99c9f",
+        "reason": "磁盘空间不足"
+      },
+      {
+        "index": 54,
+        "project": "protonmail/webclients",
+        "task_id": "instance_protonmail__webclients-08bb09914d0d37b0cd6376d4cab5b77728a43e7b",
+        "reason": "磁盘空间不足"
+      }
+    ],
+    "timeout": [],
+    "patch_failed": [],
+    "no_patch": [
+      {
+        "index": 58,
+        "project": "internetarchive/openlibrary",
+        "task_id": "instance_internetarchive__openlibrary-5069b09e5f64428dce59b33455c8bb17fe577070-v8717e18970bcdc4e0d2cea3b1527752b21e74866",
+        "reason": "未生成有效 Patch"
+      },
+      {
+        "index": 62,
+        "project": "internetarchive/openlibrary",
+        "task_id": "instance_internetarchive__openlibrary-5c6c22f3d2edf2f1b10f5dc335e32cb6a5f40341-v76304ecdb3a5954fcf13feb710e8c40fcf24b73c",
+        "reason": "未生成有效 Patch"
+      }
+    ],
+    "container_error": [],
+    "other": []
+  },
+  "project_stats": {
+    "NodeBB/NodeBB": {
+      "total": 5,
+      "success": 5,
+      "failed": 0,
+      "success_rate": 100.0,
+      "failure_reasons": {}
+    },
+    "qutebrowser/qutebrowser": {
+      "total": 7,
+      "success": 7,
+      "failed": 0,
+      "success_rate": 100.0,
+      "failure_reasons": {}
+    },
+    "ansible/ansible": {
+      "total": 9,
+      "success": 9,
+      "failed": 0,
+      "success_rate": 100.0,
+      "failure_reasons": {}
+    },
+    "internetarchive/openlibrary": {
+      "total": 10,
+      "success": 8,
+      "failed": 2,
+      "success_rate": 80.0,
+      "failure_reasons": {
+        "未生成有效 Patch": 2
+      }
+    },
+    "gravitational/teleport": {
+      "total": 8,
+      "success": 0,
+      "failed": 8,
+      "success_rate": 0.0,
+      "failure_reasons": {
+        "磁盘空间不足": 8
+      }
+    },
+    "navidrome/navidrome": {
+      "total": 5,
+      "success": 5,
+      "failed": 0,
+      "success_rate": 100.0,
+      "failure_reasons": {}
+    },
+    "element": {
+      "total": 6,
+      "success": 5,
+      "failed": 1,
+      "success_rate": 83.33,
+      "failure_reasons": {
+        "磁盘空间不足": 1
+      }
+    },
+    "future": {
+      "total": 5,
+      "success": 5,
+      "failed": 0,
+      "success_rate": 100.0,
+      "failure_reasons": {}
+    },
+    "protonmail/webclients": {
+      "total": 3,
+      "success": 0,
+      "failed": 3,
+      "success_rate": 0.0,
+      "failure_reasons": {
+        "磁盘空间不足": 3
+      }
+    },
+    "flipt": {
+      "total": 6,
+      "success": 6,
+      "failed": 0,
+      "success_rate": 100.0,
+      "failure_reasons": {}
+    }
+  }
+}

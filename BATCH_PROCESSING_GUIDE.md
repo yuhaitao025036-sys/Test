@@ -424,3 +424,15 @@ done
 - ✅ 避免重复运行
 
 现在你可以高效地分批次处理大量任务了！🚀
+
+
+
+
+# 第一批：0-49（共50个）
+nohup python test_tmux_cc_experience.py --start-index 0 --end-index 50 --no-validate > batch_0_50.log 2>&1 &
+
+# 第二批：50-99（共50个）
+nohup python test_tmux_cc_experience.py --start-index 50 --end-index 100 --no-validate > batch_50_100.log 2>&1 &
+
+# 第三批：100-149（共50个）
+nohup python test_tmux_cc_experience.py --start-index 100 --end-index 150 --no-validate > batch_100_150.log 2>&1 &

@@ -103,7 +103,7 @@ def find_ducc_binary() -> str:
 class SimpleDuccEvaluator:
     """简化的 DUCC 评估器 - 完全独立"""
     
-    def __init__(self, use_tmux=False, timeout=600):
+    def __init__(self, use_tmux=False, timeout=1800):
         self.docker_client = None
         self._container_cache = {}
         self.ducc_bin = find_ducc_binary()
@@ -379,7 +379,10 @@ class SimpleDuccEvaluator:
         
         # 创建临时目录准备接收代码
         import tempfile
-        tmpdir = tempfile.mkdtemp(prefix='swe_bench_')
+        # 使用 /ssd1/Dejavu/tmp 避免 /tmp 空间不足
+        custom_tmp_dir = '/ssd1/Dejavu/tmp'
+        os.makedirs(custom_tmp_dir, exist_ok=True)
+        tmpdir = tempfile.mkdtemp(prefix='swe_bench_', dir=custom_tmp_dir)
         local_workspace = os.path.join(tmpdir, 'workspace')
         os.makedirs(local_workspace, exist_ok=True)
         
@@ -421,7 +424,7 @@ class SimpleDuccEvaluator:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
     
-    def call_ducc(self, prompt: str, workspace: str, timeout: int = 600, use_tmux: bool = False, instance_id: str = "", task_dir: str = "") -> str:
+    def call_ducc(self, prompt: str, workspace: str, timeout: int = 1800, use_tmux: bool = False, instance_id: str = "", task_dir: str = "") -> str:
         """调用 ducc - 支持直接调用和tmux模式
         
         Args:
@@ -672,6 +675,14 @@ class SimpleDuccEvaluator:
             )
             print(f"✓ tmux session 已创建")
             
+            # ✨ 关键修复：设置超大的 history-limit 以避免输出被截断
+            # ducc 输出可能非常长，默认的 2000 行会导致早期内容丢失
+            subprocess.run(
+                ["tmux", "set-option", "-t", session_name, "history-limit", "500000"],
+                check=True
+            )
+            print(f"  ✓ 已设置 history-limit: 500000 行")
+            
             # 2. 检测并激活 conda 环境（如果需要）
             # 优先级: CONDA_DEFAULT_ENV > DEFAULT_CONDA_ENV > 硬编码默认值
             conda_env = os.environ.get('CONDA_DEFAULT_ENV') or \
@@ -729,110 +740,110 @@ class SimpleDuccEvaluator:
             else:
                 print(f"  跳过 conda 环境激活")
             
-            # 3. 构建ducc命令
+            # 3. 设置环境变量 - 与直接模式保持一致
+            # 关键：设置 DUCC_AUTO_APPROVE 和 CI 环境变量
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "export DUCC_AUTO_APPROVE=1", "Enter"],
+                check=True
+            )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "export CI=true", "Enter"],
+                check=True
+            )
+            time.sleep(0.5)
+            print(f"  ✓ 环境变量已设置: DUCC_AUTO_APPROVE=1, CI=true")
+            
+            # 4. 构建ducc命令 - 使用交互模式
             permission_mode = "bypassPermissions" if os.geteuid() != 0 else "default"
             
-            # 准备 debug 日志文件
+            # 准备文件路径（必须使用绝对路径，因为tmux工作目录是workspace）
             debug_file = None
+            prompt_file = None
+            
             if task_dir:
-                debug_file = os.path.join(task_dir, 'ducc_debug.log')
+                debug_file = os.path.abspath(os.path.join(task_dir, 'ducc_debug.log'))
+                prompt_file = os.path.abspath(os.path.join(task_dir, 'prompt.txt'))
+                
+                # 保存prompt到文件（用于后续分析）
+                with open(prompt_file, 'w', encoding='utf-8') as f:
+                    f.write(prompt)
+                print(f"  Prompt已保存: {prompt_file}")
             
-            # 注意：不使用 --effort low，保持与直接模式一致的思考深度
-            ducc_cmd = f'IS_SANDBOX=1 {self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write"'
+            # 使用交互模式（不用-p参数），这样可以实时查看
+            ducc_cmd = f'{self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write"'
             
-            # ✨ 修复：Tmux 模式也添加 --debug-file
             if debug_file:
                 ducc_cmd += f' --debug-file "{debug_file}"'
-                print(f"  Debug 日志将保存到: {debug_file}")
+                print(f"  Debug 日志: {debug_file}")
             
-            # 4. 在tmux中启动ducc
+            print(f"  命令: {ducc_cmd}")
+            
+            # 5. 在tmux中启动ducc
             subprocess.run(
                 ["tmux", "send-keys", "-t", session_name, ducc_cmd, "Enter"],
                 check=True
             )
             print(f"✓ ducc 命令已发送")
             
-            # 5. 等待ducc启动
+            # 6. 等待ducc启动
             time.sleep(3)
             
-            # 6. 自动确认trust folder等提示
+            # 7. 自动确认trust folder等提示
             auto_confirm_patterns = {
                 "Do you want to proceed": "Enter",
                 "Yes, I trust this folder": "Enter",
                 "allow all edits during this session": "Down Enter",
                 "Press Enter to continue": "Enter",
-                "Yes, I accept": "Down Enter",  # Bypass Permissions 警告
-                "No, exit": "Down Enter",  # 同上，默认是 No，需要 Down 到 Yes
-                "Pasted text": "Enter",  # ✨ 修复：自动确认粘贴文本提示
+                "Yes, I accept": "Down Enter",
+                "No, exit": "Down Enter",
             }
             
-            # 循环检查并确认提示，即使没检测到也继续等待
+            # 循环检查并确认提示
             print(f"  检查并自动确认提示...")
             for i in range(10):
                 content = self._tmux_capture_pane(session_name)
-                # ✨ 关键修复：清理 ANSI 转义序列
                 import re
                 ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
                 clean_content = ansi_escape.sub('', content)
                 
                 confirmed = False
                 for pattern, keys in auto_confirm_patterns.items():
-                    if pattern in clean_content:  # ← 在清理后的内容中检测
+                    if pattern in clean_content:
                         print(f"  检测到提示: '{pattern}', 自动发送: {keys}")
                         for key in keys.split():
                             subprocess.run(["tmux", "send-keys", "-t", session_name, key])
                         confirmed = True
-                        time.sleep(1)  # 确认后等待一下
+                        time.sleep(1)
                         break
                 if confirmed:
-                    # 确认后再检查一次是否还有其他提示
                     continue
-                # 没有检测到提示，继续等待
                 time.sleep(1)
             
-            # 7. 等待ducc就绪
+            # 8. 发送prompt
+            print(f"✓ 发送任务prompt")
             time.sleep(2)
             
-            # 8. 发送prompt（使用 tmux buffer 避免 bracketed paste 问题）
-            print(f"✓ 发送任务prompt")
-            
-            # 方法1: 尝试使用 tmux buffer（避免 bracketed paste）
             try:
-                # 将 prompt 加载到 tmux buffer
+                # 使用 tmux buffer 发送prompt
                 import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+                custom_tmp_dir = '/ssd1/Dejavu/tmp'
+                os.makedirs(custom_tmp_dir, exist_ok=True)
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', dir=custom_tmp_dir) as f:
                     f.write(prompt)
                     prompt_tmp_file = f.name
                 
-                # 加载到 buffer 并粘贴
-                subprocess.run(
-                    ["tmux", "load-buffer", prompt_tmp_file],
-                    check=True
-                )
-                subprocess.run(
-                    ["tmux", "paste-buffer", "-t", session_name],
-                    check=True
-                )
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, "Enter"],
-                    check=True
-                )
+                subprocess.run(["tmux", "load-buffer", prompt_tmp_file], check=True)
+                subprocess.run(["tmux", "paste-buffer", "-t", session_name], check=True)
+                subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], check=True)
                 
-                # 清理临时文件
                 try:
                     os.remove(prompt_tmp_file)
                 except:
                     pass
                 
                 print(f"  ✓ Prompt 已通过 tmux buffer 发送")
-                
             except Exception as e:
-                # 回退到直接发送（可能触发 bracketed paste）
-                print(f"  ⚠️  tmux buffer 方式失败，回退到直接发送: {e}")
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", session_name, prompt, "Enter"],
-                    check=True
-                )
+                print(f"  ⚠️  tmux buffer 方式失败: {e}")
             
             # 9. 监控执行直到完成
             print(f"✓ 开始监控执行...")
@@ -907,6 +918,46 @@ class SimpleDuccEvaluator:
             return result.stdout
         except:
             return ""
+    
+    def _wait_for_shell_prompt(self, session_name: str, timeout: int, check_interval: int = 5) -> None:
+        """等待shell返回prompt（简化版，用于-p模式）"""
+        import re
+        ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+        
+        start_time = time.time()
+        print(f"  等待ducc执行完成...")
+        
+        while True:
+            if time.time() - start_time > timeout:
+                print(f"  ⚠️  达到超时时间 ({timeout}秒)")
+                break
+            
+            # 检查session是否还存在
+            result = subprocess.run(
+                ["tmux", "has-session", "-t", session_name],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                print(f"  Session已关闭")
+                break
+            
+            # 捕获内容
+            content = self._tmux_capture_pane(session_name)
+            clean_content = ansi_escape.sub('', content)
+            
+            # 检测shell prompt返回（说明ducc执行完毕）
+            lines = clean_content.strip().split('\n')
+            last_line = lines[-1] if lines else ""
+            
+            # 常见的shell prompt标志
+            if any(marker in last_line for marker in ['❯', '$', '#', '>']):
+                # 确认是真的返回prompt，不是ducc内部输出
+                if len(last_line.strip()) < 50:  # prompt通常很短
+                    print(f"  ✓ 检测到shell prompt返回: {last_line.strip()[:20]}")
+                    time.sleep(2)  # 额外等待确保所有输出flush
+                    break
+            
+            time.sleep(check_interval)
     
     def _wait_for_ducc_completion(self, session_name: str, timeout: int, check_interval: int = 3) -> str:
         """等待ducc执行完成"""
@@ -1018,8 +1069,14 @@ class SimpleDuccEvaluator:
             time.sleep(check_interval)
         
         # 返回最终内容（清理 ANSI 转义序列）
+        # ✨ 增强：多次捕获确保完整性，等待可能的延迟输出
+        print(f"  等待最终输出稳定...")
+        time.sleep(2)  # 额外等待确保所有输出都到buffer
+        
         final_content = self._tmux_capture_pane(session_name)
         clean_final_content = ansi_escape.sub('', final_content)
+        
+        print(f"  ✓ 最终捕获内容长度: {len(clean_final_content)} 字符")
         return clean_final_content
     
     def _save_task_summary(self, task_dir: str, result: Dict, start_time: float):
@@ -1146,7 +1203,7 @@ class SimpleDuccEvaluator:
         dataset_info_file = os.path.join(task_dir, 'dataset_info.json')
         try:
             with open(dataset_info_file, 'w', encoding='utf-8') as f:
-                # 保存数据集的完整信息
+                # 保存数据集的完整信息（包括 ground truth patch）
                 dataset_info = {
                     'instance_id': instance_id,
                     'repo': instance.get('repo', ''),
@@ -1158,6 +1215,11 @@ class SimpleDuccEvaluator:
                     'base_commit': instance.get('base_commit', ''),
                     'hints': instance.get('hints', ''),
                     'created_at': instance.get('created_at', ''),
+                    # Ground truth patch (参考答案)
+                    'patch': instance.get('patch', ''),
+                    'test_patch': instance.get('test_patch', ''),
+                    'FAIL_TO_PASS': instance.get('FAIL_TO_PASS', ''),
+                    'PASS_TO_PASS': instance.get('PASS_TO_PASS', ''),
                 }
                 json.dump(dataset_info, f, indent=2, ensure_ascii=False)
             print(f"✓ 数据集信息已保存: {dataset_info_file}")
@@ -1211,7 +1273,62 @@ class SimpleDuccEvaluator:
                 return error_result
             
             # 4. 提取 patch
-            patch = self._extract_patch(output)
+            # ✨ 优先策略：从ducc生成的fix.patch文件读取（最可靠）
+            patch = ""
+            fix_patch_file = os.path.join(workspace, 'fix.patch')
+            
+            if os.path.exists(fix_patch_file):
+                try:
+                    with open(fix_patch_file, 'r', encoding='utf-8') as f:
+                        patch = f.read().strip()
+                    if patch and ('diff --git' in patch or '@@' in patch):
+                        print(f"✓ 从fix.patch文件读取到patch (长度: {len(patch)} 字符)")
+                    else:
+                        print(f"⚠️  fix.patch文件存在但内容无效，尝试其他来源")
+                        patch = ""
+                except Exception as e:
+                    print(f"⚠️  读取fix.patch失败: {e}")
+            
+            # 备用方案1：从输出中提取
+            if not patch:
+                print(f"  尝试从ducc输出中提取patch...")
+                patch = self._extract_patch(output)
+            
+            # 备用方案2：从debug文件提取（tmux模式）
+            if self.use_tmux and (not patch or ('diff --git' not in patch and '@@' not in patch)):
+                print(f"  ⚠️  从输出中未提取到有效patch，尝试其他来源...")
+                
+                debug_file = os.path.join(task_dir, 'ducc_debug.log')
+                if os.path.exists(debug_file):
+                    try:
+                        with open(debug_file, 'r', encoding='utf-8') as f:
+                            debug_content = f.read()
+                        debug_patch = self._extract_patch(debug_content)
+                        if debug_patch and ('diff --git' in debug_patch or '@@' in debug_patch):
+                            print(f"  ✓ 从debug文件中成功提取patch (长度: {len(debug_patch)})")
+                            patch = debug_patch
+                    except Exception as e:
+                        print(f"  ✗ 读取debug文件失败: {e}")
+                
+                # 备用方案3：从workspace中查找其他.diff或.patch文件
+                if not patch or ('diff --git' not in patch and '@@' not in patch):
+                    print(f"  尝试从workspace查找其他patch文件...")
+                    try:
+                        import glob
+                        diff_files = glob.glob(os.path.join(workspace, '*.diff')) + \
+                                    glob.glob(os.path.join(workspace, '*.patch'))
+                        # 排除fix.patch（已经检查过了）
+                        diff_files = [f for f in diff_files if f != fix_patch_file]
+                        if diff_files:
+                            # 选择最新的文件
+                            latest_diff = max(diff_files, key=os.path.getmtime)
+                            with open(latest_diff, 'r', encoding='utf-8') as f:
+                                file_patch = f.read()
+                            if file_patch and ('diff --git' in file_patch or '@@' in file_patch):
+                                print(f"  ✓ 从文件中找到patch: {os.path.basename(latest_diff)} (长度: {len(file_patch)})")
+                                patch = file_patch
+                    except Exception as e:
+                        print(f"  ✗ 查找patch文件失败: {e}")
             
             # 保存提取的patch
             if patch:
@@ -1304,10 +1421,12 @@ class SimpleDuccEvaluator:
 1. Explore the codebase in the current directory to understand the structure
 2. Locate the relevant files related to this issue
 3. Generate a patch that fixes the issue with minimal, targeted changes
-4. Output ONLY the patch in unified diff format (no explanations)
+4. **IMPORTANT**: Save the final patch to a file named `fix.patch` in the current directory
+5. The patch should be in unified diff format
 
 ## Output Format
-Output the patch in unified diff format (and nothing else):
+After you complete the fix, use the Write tool to save the patch to `fix.patch`:
+
 ```diff
 diff --git a/file.py b/file.py
 --- a/file.py
@@ -1317,10 +1436,12 @@ diff --git a/file.py b/file.py
 +    new_line
 ```
 
-Generate the patch now. Do not include any explanation or commentary, only output the diff."""
+**CRITICAL**: You MUST write the final patch to the file `fix.patch` in the current directory. This is mandatory."""
     
     def _extract_patch(self, output: str) -> str:
         """从 ducc 输出提取 patch"""
+        import re
+        
         # 1. 尝试提取 markdown 代码块中的 diff
         if '```diff' in output:
             start = output.find('```diff') + 7
@@ -1329,7 +1450,6 @@ Generate the patch now. Do not include any explanation or commentary, only outpu
                 return output[start:end].strip()
         
         # 2. 清理 XML 标签 (移除 <think>, <minimax:tool_call> 等)
-        import re
         # 移除所有 XML 标签
         cleaned = re.sub(r'<[^>]+>', '', output)
         
@@ -1339,9 +1459,40 @@ Generate the patch now. Do not include any explanation or commentary, only outpu
             diff_start = cleaned.find('diff --git')
             patch_content = cleaned[diff_start:]
             
-            # 可选: 清理 patch 后面的无关内容 (比如多余的解释)
-            # 但保留完整的 diff 内容
-            return patch_content.strip()
+            # ✨ 增强：智能识别patch结束位置
+            # Patch通常在遇到以下内容时结束：
+            # - 工具调用的标记（如 "Tool:" 或 "Read(" 等）
+            # - 明显的非diff内容（如普通对话）
+            # - Shell prompt标记
+            
+            # 尝试找到patch的结束位置
+            end_markers = [
+                r'\n\n[^\s\-\+\@].*?:\s',  # 冒号开头的标签（如 "Tool:"）
+                r'\nRead\(',  # 工具调用
+                r'\nWrite\(',
+                r'\nEdit\(',
+                r'\n❯\s',  # Shell prompt
+                r'\n\$\s',
+                r'\n\(dejavu\)',  # Conda环境提示
+            ]
+            
+            end_pos = len(patch_content)
+            for marker_pattern in end_markers:
+                match = re.search(marker_pattern, patch_content)
+                if match:
+                    potential_end = match.start()
+                    # 确保我们至少提取了一些内容（避免过早截断）
+                    if potential_end > 100:  # 至少100字符
+                        end_pos = min(end_pos, potential_end)
+            
+            patch_content = patch_content[:end_pos].strip()
+            
+            # 额外验证：patch应该包含基本的diff结构
+            if '@@' in patch_content or '---' in patch_content:
+                return patch_content
+            else:
+                # 如果没有标准diff结构，返回原内容
+                return cleaned[diff_start:].strip()
         
         # 4. 如果没有找到标准 diff,返回清理后的内容
         return cleaned.strip()
@@ -1450,6 +1601,30 @@ Generate the patch now. Do not include any explanation or commentary, only outpu
             
             # 3. 写入 patch
             print(f"\n[3/6] 写入 patch 文件...")
+            
+            # 清理 patch 中的路径前缀问题
+            # 如果 workdir 是 /app，patch 中的路径可能是 app/xxx，需要清理
+            import re
+            if workdir and workdir != '/':
+                workdir_basename = os.path.basename(workdir.rstrip('/'))
+                # 修复: a/app/file.py -> a/file.py
+                patch = re.sub(
+                    r'(diff --git a/)' + re.escape(workdir_basename) + r'/',
+                    r'\1',
+                    patch
+                )
+                patch = re.sub(
+                    r'(--- a/)' + re.escape(workdir_basename) + r'/',
+                    r'\1',
+                    patch
+                )
+                patch = re.sub(
+                    r'(\+\+\+ b/)' + re.escape(workdir_basename) + r'/',
+                    r'\1',
+                    patch
+                )
+                print(f"  ✓ 已清理 patch 路径前缀: {workdir_basename}/")
+            
             write_cmd = f"cat > /tmp/fix.patch << 'EOF'\n{patch}\nEOF"
             print(f"  Patch 长度: {len(patch)} 字符")
             print(f"  Patch 预览 (前 300 字符):")
@@ -1747,8 +1922,8 @@ def main():
                        help='使用 tmux 模式运行 ducc (可通过 tmux attach 查看实时执行)')
     parser.add_argument('--conda-env', type=str, default='dejavu',
                        help='tmux 模式下使用的 conda 环境名称 (默认: dejavu)')
-    parser.add_argument('--timeout', type=int, default=600,
-                       help='ducc 执行超时时间（秒），默认 600 (10分钟)')
+    parser.add_argument('--timeout', type=int, default=1800,
+                       help='ducc 执行超时时间（秒），默认 1800 (30分钟)')
     parser.add_argument('--output-dir', default='./swe_bench_output_ducc', help='输出目录')
     args = parser.parse_args()
     
