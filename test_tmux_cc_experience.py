@@ -102,17 +102,154 @@ def find_ducc_binary() -> str:
 
 class SimpleDuccEvaluator:
     """简化的 DUCC 评估器 - 完全独立"""
-    
-    def __init__(self, use_tmux=False, timeout=1800):
+
+    def __init__(self, use_tmux=False, timeout=1800, in_container=False):
         self.docker_client = None
         self._container_cache = {}
-        self.ducc_bin = find_ducc_binary()
+        self.in_container = in_container
+        if not in_container:
+            self.ducc_bin = find_ducc_binary()
+        else:
+            self.ducc_bin = None
         self.use_tmux = use_tmux
         self.timeout = timeout
+
+        # ducc 安装目录（用于注入容器）
+        self._ducc_claude_code_dir = os.path.join(
+            os.path.expanduser("~/.baidu-cc"),
+            "baidu-cc-linux-amd64-2.1.116.2",
+            "claude-code"
+        )
+        self._ducc_settings_file = os.path.join(
+            os.path.expanduser("~/.baidu-cc"),
+            "baidu-cc",
+            "settings.json"
+        )
         
     def __del__(self):
         self.cleanup()
     
+    def _inject_ducc_into_container(self, container):
+        """把 ducc 运行时注入到运行中的容器"""
+
+        print(f"  注入 ducc 到容器 {container.id[:12]}...")
+
+        # 1. 把 claude-code 目录复制到容器
+        claude_code_dir = self._ducc_claude_code_dir
+        if not os.path.isdir(claude_code_dir):
+            raise FileNotFoundError(f"ducc claude-code 目录不存在: {claude_code_dir}")
+
+        # 创建 /opt/ducc 目录
+        container.exec_run("mkdir -p /opt/ducc")
+
+        # 使用 docker cp 命令（比 put_archive 更高效处理大目录）
+        import subprocess
+        cp_result = subprocess.run(
+            ['docker', 'cp', claude_code_dir, f'{container.id}:/opt/ducc/claude-code'],
+            capture_output=True, text=True, timeout=120
+        )
+        if cp_result.returncode != 0:
+            raise RuntimeError(f"docker cp 失败: {cp_result.stderr}")
+        print(f"    ✓ claude-code 目录已注入 /opt/ducc/claude-code/")
+
+        # 2. 读取 settings.json 获取认证信息
+        with open(self._ducc_settings_file, 'r') as f:
+            settings = json.load(f)
+        env_vars = settings.get('env', {})
+
+        auth_token = env_vars.get('ANTHROPIC_AUTH_TOKEN', '')
+        base_url = env_vars.get('ANTHROPIC_BASE_URL', '')
+        model = env_vars.get('ANTHROPIC_MODEL', 'Claude Opus 4.6')
+        custom_headers = env_vars.get('ANTHROPIC_CUSTOM_HEADERS', '')
+
+        # 3. 创建非 root 用户 ducc（Claude Code 不允许 root 使用 bypassPermissions）
+        container.exec_run(['sh', '-c', 'id ducc 2>/dev/null || useradd -m -s /bin/bash ducc'])
+        print(f"    ✓ 用户 ducc 已创建")
+
+        # 4. 创建 /usr/local/bin/ducc 启动脚本
+        # 用 tempfile + docker cp 避免 heredoc 中 $@ 被转义的问题
+        wrapper_script = f'''#!/bin/bash
+export ANTHROPIC_AUTH_TOKEN="{auth_token}"
+export ANTHROPIC_BASE_URL="{base_url}"
+export ANTHROPIC_MODEL="{model}"
+export ANTHROPIC_CUSTOM_HEADERS='{custom_headers}'
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_AUTOUPDATER=1
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+export HOME=/home/ducc
+exec /opt/ducc/claude-code/bin/claude.exe "$@"
+'''
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as tmp:
+            tmp.write(wrapper_script)
+            tmp_path = tmp.name
+        try:
+            os.chmod(tmp_path, 0o755)
+            cp_script = subprocess.run(
+                ['docker', 'cp', tmp_path, f'{container.id}:/usr/local/bin/ducc'],
+                capture_output=True, text=True, timeout=30
+            )
+            if cp_script.returncode != 0:
+                raise RuntimeError(f"docker cp ducc wrapper 失败: {cp_script.stderr}")
+        finally:
+            os.unlink(tmp_path)
+        print(f"    ✓ /usr/local/bin/ducc 启动脚本已创建")
+
+        # 5. 创建 /home/ducc/.claude/settings.json
+        claude_settings = {
+            "skipDangerousModePermissionPrompt": True,
+            "alwaysThinkingEnabled": False,
+        }
+        container.exec_run(['mkdir', '-p', '/home/ducc/.claude'])
+        container.exec_run(['sh', '-c', f"cat > /home/ducc/.claude/settings.json << 'EOF'\n{json.dumps(claude_settings, indent=2)}\nEOF"])
+
+        # 6. 创建 /home/ducc/.claude.json（标记 onboarding 完成）
+        claude_json = {
+            "hasCompletedOnboarding": True,
+            "numStartups": 1,
+        }
+        container.exec_run(['sh', '-c', f"cat > /home/ducc/.claude.json << 'EOF'\n{json.dumps(claude_json, indent=2)}\nEOF"])
+
+        # 7. 确保 ducc 用户对工作目录有写权限
+        container.exec_run(['sh', '-c', 'chmod -R a+rw /app 2>/dev/null; chmod -R a+rw /testbed 2>/dev/null; true'])
+        container.exec_run(['chown', '-R', 'ducc:ducc', '/home/ducc'])
+        print(f"    ✓ /home/ducc/.claude/ 配置已创建")
+
+        # 8. 验证 ducc 可运行（用 ducc 用户）
+        result = container.exec_run(['su', '-', 'ducc', '-c', 'ducc --version'])
+        if result.exit_code == 0:
+            version = result.output.decode().strip()
+            print(f"    ✓ ducc 验证成功 (user=ducc): {version}")
+        else:
+            error = result.output.decode().strip()
+            print(f"    ⚠️  ducc 验证失败 (exit={result.exit_code}): {error[:200]}")
+            # 尝试直接执行
+            result2 = container.exec_run(['su', '-', 'ducc', '-c', '/opt/ducc/claude-code/bin/claude.exe --version'])
+            if result2.exit_code == 0:
+                print(f"    ✓ claude.exe 可直接运行: {result2.output.decode().strip()}")
+            else:
+                raise RuntimeError(f"ducc 注入失败，无法在容器内运行")
+
+        # 9. 验证网络连通性（API 可达）
+        api_check = container.exec_run(['sh', '-c', f'curl -s -o /dev/null -w "%{{http_code}}" {base_url}/ 2>/dev/null || echo "FAIL"'])
+        api_output = api_check.output.decode().strip()
+        if api_output.startswith(('2', '3', '4')):
+            print(f"    ✓ API 可达 ({base_url})")
+        else:
+            print(f"    ⚠️  API 连接检测异常: {api_output}（可能需等网络就绪）")
+
+    def _detect_container_workdir(self, container) -> str:
+        """探测容器内的代码工作目录"""
+        for candidate in ['/testbed', '/app', '/workspace', '/src']:
+            result = container.exec_run(['test', '-d', candidate])
+            if result.exit_code == 0:
+                # 进一步检查是否有代码文件
+                result2 = container.exec_run(['sh', '-c', f'ls {candidate}/ | head -5'])
+                if result2.exit_code == 0 and result2.output.decode().strip():
+                    print(f"  ✓ 容器工作目录: {candidate}")
+                    return candidate
+        print(f"  ⚠️  未找到标准工作目录，使用 /testbed")
+        return '/testbed'
+
     def _copy_claude_session_trace(self, workspace: str, task_dir: str, start_time: float):
         """查找并复制 Claude/ducc 的 session 轨迹到任务目录
         
@@ -221,6 +358,153 @@ class SimpleDuccEvaluator:
             print(f"  ⚠️  复制 Claude session 失败: {e}")
             import traceback
             traceback.print_exc()
+
+    def _copy_claude_session_from_container(self, container, task_dir: str, start_time: float):
+        """从容器内提取 Claude/ducc 的 session 轨迹到任务目录
+        
+        Args:
+            container: Docker 容器对象
+            task_dir: 任务目录
+            start_time: 任务开始时间（用于过滤最近的 session）
+        """
+        import tarfile
+        import io
+        
+        try:
+            # 容器内 ducc 用户的 home 目录下的 .claude/projects
+            # 可能的路径: /home/ducc/.claude/projects 或 /root/.claude/projects
+            possible_paths = [
+                '/home/ducc/.claude/projects',
+                '/root/.claude/projects',
+            ]
+            
+            claude_projects_dir = None
+            for path in possible_paths:
+                result = container.exec_run(['test', '-d', path])
+                if result.exit_code == 0:
+                    claude_projects_dir = path
+                    print(f"  找到容器内 Claude projects 目录: {claude_projects_dir}")
+                    break
+            
+            if not claude_projects_dir:
+                print(f"  ⚠️  容器内未找到 Claude projects 目录")
+                return
+            
+            # 列出所有 session 文件
+            find_cmd = f"find {claude_projects_dir} -name '*.jsonl' -type f -mmin -30 2>/dev/null"
+            result = container.exec_run(['bash', '-c', find_cmd])
+            if result.exit_code != 0 or not result.output:
+                print(f"  ⚠️  未找到容器内的 session 文件")
+                return
+            
+            session_files = result.output.decode('utf-8', errors='replace').strip().split('\n')
+            session_files = [f for f in session_files if f.strip()]
+            
+            if not session_files:
+                print(f"  ⚠️  容器内没有近期的 session 文件")
+                return
+            
+            # 获取每个文件的修改时间和大小，找最新的
+            all_sessions = []
+            for session_path in session_files:
+                stat_cmd = f"stat -c '%Y %s' '{session_path}' 2>/dev/null"
+                stat_result = container.exec_run(['bash', '-c', stat_cmd])
+                if stat_result.exit_code == 0:
+                    parts = stat_result.output.decode().strip().split()
+                    if len(parts) == 2:
+                        mtime = int(parts[0])
+                        size = int(parts[1])
+                        all_sessions.append({
+                            'path': session_path,
+                            'mtime': mtime,
+                            'size': size
+                        })
+            
+            if not all_sessions:
+                print(f"  ⚠️  无法获取容器内 session 文件信息")
+                return
+            
+            # 按修改时间排序，取最近的
+            all_sessions.sort(key=lambda x: x['mtime'], reverse=True)
+            latest_session = all_sessions[0]
+            
+            print(f"  找到最新 session: {latest_session['path']} ({latest_session['size']/1024:.1f} KB)")
+            
+            # 从容器提取文件
+            try:
+                bits, stat = container.get_archive(latest_session['path'])
+                tar_data = b''.join(bits)
+                
+                with tarfile.open(fileobj=io.BytesIO(tar_data), mode='r') as tar:
+                    for member in tar.getmembers():
+                        f = tar.extractfile(member)
+                        if f:
+                            session_content = f.read()
+                            break
+                
+                # 保存到任务目录
+                session_dest = os.path.join(task_dir, 'claude_session.jsonl')
+                with open(session_dest, 'wb') as f:
+                    f.write(session_content)
+                
+                print(f"  ✓ Claude session 轨迹已提取: claude_session.jsonl")
+                
+                # 保存 session 元信息
+                session_info = {
+                    'container_path': latest_session['path'],
+                    'container_id': container.id[:12],
+                    'modified_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(latest_session['mtime'])),
+                    'file_size_bytes': latest_session['size'],
+                }
+                session_info_file = os.path.join(task_dir, 'claude_session_info.json')
+                with open(session_info_file, 'w', encoding='utf-8') as f:
+                    json.dump(session_info, f, indent=2)
+                
+                # 生成摘要
+                self._generate_session_summary(session_dest, task_dir)
+                
+            except Exception as e:
+                print(f"  ⚠️  从容器提取 session 文件失败: {e}")
+                
+        except Exception as e:
+            print(f"  ⚠️  复制容器内 Claude session 失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _generate_session_summary(self, session_file: str, task_dir: str):
+        """生成 session 摘要"""
+        try:
+            summary_lines = []
+            with open(session_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        event = json.loads(line)
+                        event_type = event.get('type', 'unknown')
+                        summary_lines.append(event_type)
+                    except:
+                        continue
+            
+            from collections import Counter
+            event_counts = Counter(summary_lines)
+            
+            summary_file = os.path.join(task_dir, 'claude_session_summary.txt')
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("Claude Session 轨迹摘要\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"Session 文件: claude_session.jsonl\n")
+                f.write(f"总事件数: {len(summary_lines)}\n\n")
+                f.write("事件类型统计:\n")
+                for event_type, count in event_counts.most_common():
+                    f.write(f"  {event_type:20s}: {count:5d}\n")
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("查看完整轨迹:\n")
+                f.write("  cat claude_session.jsonl | jq\n")
+                f.write("  cat claude_session.jsonl | jq -r '.type' | sort | uniq -c\n")
+            
+            print(f"  ✓ Session 摘要已生成: claude_session_summary.txt")
+        except Exception as e:
+            print(f"  ⚠️  生成 session 摘要失败: {e}")
     
     def cleanup(self):
         """清理所有容器"""
@@ -297,6 +581,7 @@ class SimpleDuccEvaluator:
             'tty': True,
             'privileged': True,
             'security_opt': ['seccomp=unconfined'],
+            'network_mode': 'host',  # 使用宿主机网络，继承宿主机 DNS 和路由
             'ulimits': [
                 docker.types.Ulimit(name='nproc', soft=65535, hard=65535),
                 docker.types.Ulimit(name='nofile', soft=65535, hard=65535),
@@ -330,6 +615,9 @@ class SimpleDuccEvaluator:
             container.reload()
             if container.status == 'running':
                 print(f"✓ 容器已启动")
+                # 如果是容器内模式，注入 ducc
+                if self.in_container:
+                    self._inject_ducc_into_container(container)
                 return container
         
         # 超时后打印诊断信息
@@ -424,6 +712,254 @@ class SimpleDuccEvaluator:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
     
+    def call_ducc_in_container(self, container, prompt: str, workdir: str, timeout: int = 1800,
+                               use_tmux: bool = False, instance_id: str = "", task_dir: str = "") -> str:
+        """在容器内调用 ducc"""
+        print(f"\n正在容器内调用 ducc...")
+        print(f"  容器: {container.id[:12]}")
+        print(f"  工作目录: {workdir}")
+        print(f"  超时设置: {timeout}秒")
+        print(f"  运行模式: {'tmux模式' if use_tmux else 'exec模式'}")
+        print(f"  prompt 长度: {len(prompt)} 字符")
+
+        # 保存 prompt 到任务目录
+        if task_dir:
+            prompt_file = os.path.join(task_dir, 'prompt.txt')
+            try:
+                with open(prompt_file, 'w', encoding='utf-8') as f:
+                    f.write(prompt)
+                print(f"  ✓ Prompt 已保存: {prompt_file}")
+            except Exception as e:
+                print(f"  ⚠️  保存 prompt 失败: {e}")
+
+        if use_tmux:
+            return self._call_ducc_in_container_tmux(container, prompt, workdir, timeout, instance_id, task_dir)
+        else:
+            return self._call_ducc_in_container_direct(container, prompt, workdir, timeout, task_dir)
+
+    def _call_ducc_in_container_direct(self, container, prompt: str, workdir: str, timeout: int, task_dir: str = "") -> str:
+        """exec 模式：直接在容器内运行 ducc"""
+        import re
+        import tarfile
+        import io
+        import threading
+
+        # 1. 把 prompt 写入容器内临时文件（避免 shell 转义问题）
+        prompt_container_path = '/tmp/ducc_prompt.txt'
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode='w') as tar:
+            prompt_bytes = prompt.encode('utf-8')
+            info = tarfile.TarInfo(name='ducc_prompt.txt')
+            info.size = len(prompt_bytes)
+            tar.addfile(info, io.BytesIO(prompt_bytes))
+        tar_buffer.seek(0)
+        container.put_archive('/tmp', tar_buffer)
+
+        # 2. 构建 ducc 命令（用 ducc 用户执行，避免 root 限制）
+        shell_cmd = f'cd {workdir} && export CI=true && export DUCC_AUTO_APPROVE=1 && ducc -p "$(cat {prompt_container_path})" --allowedTools "Read,Edit,Write,Bash" --permission-mode bypassPermissions'
+
+        print(f"  命令: ducc -p <prompt> --allowedTools ... --permission-mode bypassPermissions (user=ducc)")
+        print(f"  开始时间: {time.strftime('%H:%M:%S')}")
+        start_time = time.time()
+
+        # 3. 在容器内执行（docker exec --user ducc）
+        try:
+            import subprocess
+            docker_exec_cmd = [
+                'docker', 'exec',
+                '--user', 'ducc',
+                '-e', 'HOME=/home/ducc',
+                '-e', 'CI=true',
+                '-e', 'DUCC_AUTO_APPROVE=1',
+                container.id,
+                'bash', '-c', shell_cmd,
+            ]
+
+            result = subprocess.run(
+                docker_exec_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                input='',
+            )
+            output = result.stdout
+            if result.stderr:
+                output += '\n' + result.stderr
+
+            duration = time.time() - start_time
+            print(f"  完成时间: {time.strftime('%H:%M:%S')}")
+            print(f"  执行耗时: {duration:.2f}秒")
+            print(f"  退出码: {result.returncode}")
+            print(f"  输出长度: {len(output)} 字符")
+
+            if result.returncode != 0:
+                print(f"  ⚠️  ducc 返回非零退出码: {result.returncode}")
+                if output:
+                    print(f"  输出预览: {output[:300]}...")
+
+            # 保存执行日志
+            if task_dir:
+                log_file = os.path.join(task_dir, 'ducc_execution.log')
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write("DUCC 执行日志 (容器内 exec 模式)\n")
+                    f.write("=" * 80 + "\n")
+                    f.write(f"容器 ID: {container.id[:12]}\n")
+                    f.write(f"工作目录: {workdir}\n")
+                    f.write(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}\n")
+                    f.write(f"执行耗时: {duration:.2f}秒\n")
+                    f.write(f"退出码: {result.returncode}\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(output)
+                print(f"  ✓ 执行日志已保存: {log_file}")
+
+            return output
+
+        except subprocess.TimeoutExpired:
+            duration = time.time() - start_time
+            print(f"  ⚠️  超时 ({timeout}秒, 耗时 {duration:.2f}秒)")
+            if task_dir:
+                log_file = os.path.join(task_dir, 'ducc_execution.log')
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write(f"执行超时: {timeout}秒\n")
+            return ""
+
+        except Exception as e:
+            duration = time.time() - start_time
+            print(f"  ✗ 执行失败 ({duration:.2f}秒): {e}")
+
+            if task_dir:
+                log_file = os.path.join(task_dir, 'ducc_execution.log')
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write(f"执行异常: {str(e)}\n")
+                    f.write(f"耗时: {duration:.2f}秒\n")
+
+            return ""
+
+    def _call_ducc_in_container_tmux(self, container, prompt: str, workdir: str, timeout: int,
+                                      instance_id: str = "", task_dir: str = "") -> str:
+        """tmux 模式：在容器内用 tmux 运行 ducc，可实时查看"""
+        import re
+
+        # 1. 检查容器内是否有 tmux，没有则尝试安装
+        result = container.exec_run(['which', 'tmux'])
+        if result.exit_code != 0:
+            print(f"  容器内无 tmux，尝试安装...")
+            install_result = container.exec_run(['sh', '-c', 'apt-get update -qq && apt-get install -y -qq tmux 2>/dev/null || true'])
+            result = container.exec_run(['which', 'tmux'])
+            if result.exit_code != 0:
+                print(f"  ⚠️  无法安装 tmux，回退到 exec 模式")
+                return self._call_ducc_in_container_direct(container, prompt, workdir, timeout, task_dir)
+            print(f"  ✓ tmux 安装成功")
+
+        # 2. 写入 prompt 文件
+        import tarfile
+        import io
+        prompt_container_path = '/tmp/ducc_prompt.txt'
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode='w') as tar:
+            prompt_bytes = prompt.encode('utf-8')
+            info = tarfile.TarInfo(name='ducc_prompt.txt')
+            info.size = len(prompt_bytes)
+            tar.addfile(info, io.BytesIO(prompt_bytes))
+        tar_buffer.seek(0)
+        container.put_archive('/tmp', tar_buffer)
+
+        # 3. 创建 tmux session 名称
+        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', instance_id)[:30]
+        session_name = f"ducc_{safe_id}"
+
+        # 4. 构建 ducc 命令（用 ducc 用户执行）
+        shell_cmd = f'cd {workdir} && ducc -p "$(cat {prompt_container_path})" --allowedTools "Read,Edit,Write,Bash" --permission-mode bypassPermissions'
+
+        # 5. 启动 tmux session
+        # 先清理可能残留的旧 session
+        container.exec_run(['tmux', 'kill-session', '-t', session_name])
+
+        # 设置环境变量并启动（以 ducc 用户运行）
+        env_setup = 'export CI=true && export DUCC_AUTO_APPROVE=1 && export HOME=/home/ducc'
+        ducc_user_cmd = f'{env_setup} && {shell_cmd}'
+        container.exec_run(
+            ['tmux', 'new-session', '-d', '-s', session_name, '-c', workdir, 'bash', '-c', ducc_user_cmd],
+            user='ducc',
+            environment={'HOME': '/home/ducc'},
+        )
+
+        print(f"\n{'='*60}")
+        print(f"  tmux session 已启动: {session_name}")
+        print(f"  查看执行过程: docker exec -it {container.id[:12]} tmux attach -t {session_name}")
+        print(f"{'='*60}\n")
+
+        # 6. 等待执行完成
+        start_time = time.time()
+        ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+        last_content = ""
+        idle_count = 0
+
+        while True:
+            if time.time() - start_time > timeout:
+                print(f"  ⚠️  达到超时时间 ({timeout}秒)")
+                break
+
+            # 检查 tmux session 是否还存在
+            result = container.exec_run(['tmux', 'has-session', '-t', session_name])
+            if result.exit_code != 0:
+                print(f"  ✓ tmux session 已结束（ducc 执行完毕）")
+                break
+
+            # 捕获 pane 内容
+            result = container.exec_run(['tmux', 'capture-pane', '-p', '-t', session_name, '-S', '-'])
+            if result.exit_code == 0:
+                content = result.output.decode('utf-8', errors='replace')
+                clean_content = ansi_escape.sub('', content)
+
+                if content == last_content:
+                    idle_count += 1
+                    if idle_count >= 10:
+                        # 检查 ducc 进程是否还在运行
+                        proc_check = container.exec_run(['sh', '-c', 'pgrep -f "claude.exe" || echo "not_running"'])
+                        if 'not_running' in proc_check.output.decode():
+                            print(f"  ✓ ducc 进程已结束")
+                            break
+                else:
+                    idle_count = 0
+                    last_content = content
+            else:
+                break
+
+            time.sleep(5)
+
+        # 7. 获取最终输出
+        final_output = ""
+        result = container.exec_run(['tmux', 'capture-pane', '-p', '-t', session_name, '-S', '-'])
+        if result.exit_code == 0:
+            final_output = result.output.decode('utf-8', errors='replace')
+            final_output = ansi_escape.sub('', final_output)
+
+        # 清理 tmux session
+        container.exec_run(['tmux', 'kill-session', '-t', session_name])
+
+        duration = time.time() - start_time
+        print(f"  执行耗时: {duration:.2f}秒")
+        print(f"  输出长度: {len(final_output)} 字符")
+
+        # 保存日志
+        if task_dir:
+            log_file = os.path.join(task_dir, 'ducc_execution.log')
+            with open(log_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("DUCC 执行日志 (容器内 tmux 模式)\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"容器 ID: {container.id[:12]}\n")
+                f.write(f"Session: {session_name}\n")
+                f.write(f"工作目录: {workdir}\n")
+                f.write(f"执行耗时: {duration:.2f}秒\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(final_output)
+            print(f"  ✓ 执行日志已保存: {log_file}")
+
+        return final_output
+
     def call_ducc(self, prompt: str, workspace: str, timeout: int = 1800, use_tmux: bool = False, instance_id: str = "", task_dir: str = "") -> str:
         """调用 ducc - 支持直接调用和tmux模式
         
@@ -474,6 +1010,7 @@ class SimpleDuccEvaluator:
             self.ducc_bin,
             "-p", prompt,
             "--allowedTools", "Read,Edit,Write",
+            "--effort", "low",  # 新版ducc默认启用effort，导致Bedrock API 400错误，明确设置为low
         ]
         
         # 权限模式: 尽量自动批准,避免等待确认
@@ -770,7 +1307,8 @@ class SimpleDuccEvaluator:
                 print(f"  Prompt已保存: {prompt_file}")
             
             # 使用交互模式（不用-p参数），这样可以实时查看
-            ducc_cmd = f'{self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write"'
+            # 注意：新版ducc默认启用effort，导致Bedrock API 400错误，明确设置为low
+            ducc_cmd = f'{self.ducc_bin} --permission-mode {permission_mode} --allowedTools "Read,Edit,Write" --effort low'
             
             if debug_file:
                 ducc_cmd += f' --debug-file "{debug_file}"'
@@ -1218,8 +1756,8 @@ class SimpleDuccEvaluator:
                     # Ground truth patch (参考答案)
                     'patch': instance.get('patch', ''),
                     'test_patch': instance.get('test_patch', ''),
-                    'FAIL_TO_PASS': instance.get('FAIL_TO_PASS', ''),
-                    'PASS_TO_PASS': instance.get('PASS_TO_PASS', ''),
+                    'fail_to_pass': instance.get('fail_to_pass', ''),
+                    'pass_to_pass': instance.get('pass_to_pass', ''),
                 }
                 json.dump(dataset_info, f, indent=2, ensure_ascii=False)
             print(f"✓ 数据集信息已保存: {dataset_info_file}")
@@ -1228,13 +1766,18 @@ class SimpleDuccEvaluator:
         
         start_time = time.time()
         tmpdir_to_cleanup = None
-        
+
         try:
+            if self.in_container:
+                # ===== 容器内模式：直接在容器内运行 ducc =====
+                return self._evaluate_single_in_container(instance, instance_id, task_dir, start_time, output_dir)
+
+            # ===== 宿主机模式（原有逻辑）=====
             # 1. 提取整个代码库到本地
             print("\n正在提取代码库...")
             workspace, container_workdir, tmpdir_to_cleanup = self.extract_codebase(instance)
             
-            # 2. 构建简化的 prompt (agent 可以自己探索代码)
+            # 2. 构建 prompt (agent 可以自己探索代码)
             prompt = self._build_prompt(instance)
             
             # 3. 调用 ducc (agent 在 workspace 目录操作)
@@ -1275,68 +1818,202 @@ class SimpleDuccEvaluator:
             # 4. 提取 patch
             # ✨ 优先策略：从ducc生成的fix.patch文件读取（最可靠）
             patch = ""
+            patch_source = "none"  # 记录patch来源
             fix_patch_file = os.path.join(workspace, 'fix.patch')
+            
+            print(f"\n{'='*60}")
+            print(f"📋 开始提取 Patch")
+            print(f"{'='*60}")
+            print(f"[DEBUG] workspace 路径: {workspace}")
+            print(f"[DEBUG] fix.patch 完整路径: {fix_patch_file}")
+            print(f"[DEBUG] fix.patch 文件存在: {os.path.exists(fix_patch_file)}")
+            
+            # 列出workspace中的所有文件
+            try:
+                all_files = os.listdir(workspace)
+                print(f"[DEBUG] workspace 中的文件 ({len(all_files)} 个):")
+                for f in sorted(all_files)[:20]:  # 最多显示20个
+                    fpath = os.path.join(workspace, f)
+                    if os.path.isfile(fpath):
+                        fsize = os.path.getsize(fpath)
+                        print(f"  - {f} ({fsize} bytes)")
+                    else:
+                        print(f"  - {f}/ (目录)")
+                if len(all_files) > 20:
+                    print(f"  ... 还有 {len(all_files) - 20} 个文件")
+            except Exception as e:
+                print(f"[DEBUG] 列出workspace文件失败: {e}")
+            
+            # 检查git状态，验证agent是否真的执行了git diff
+            print(f"\n[DEBUG] 检查 Git 状态...")
+            try:
+                # 检查是否是git仓库
+                git_dir = os.path.join(workspace, '.git')
+                is_git_repo = os.path.isdir(git_dir)
+                print(f"[DEBUG] 是否是git仓库: {is_git_repo}")
+                
+                if is_git_repo:
+                    # 检查git status
+                    result = subprocess.run(
+                        ['git', 'status', '--porcelain'],
+                        cwd=workspace,
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    git_status = result.stdout.strip()
+                    if git_status:
+                        modified_files = [line.strip() for line in git_status.split('\n') if line.strip()]
+                        print(f"[DEBUG] git status 显示 {len(modified_files)} 个文件有变动:")
+                        for mf in modified_files[:10]:
+                            print(f"  {mf}")
+                        if len(modified_files) > 10:
+                            print(f"  ... 还有 {len(modified_files) - 10} 个")
+                    else:
+                        print(f"[DEBUG] git status 为空 (没有未提交的修改)")
+                    
+                    # 直接执行git diff看看输出
+                    result = subprocess.run(
+                        ['git', 'diff'],
+                        cwd=workspace,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    live_diff = result.stdout
+                    print(f"[DEBUG] 实时 git diff 输出长度: {len(live_diff)} 字符")
+                    if live_diff:
+                        print(f"[DEBUG] 实时 git diff 前200字符:")
+                        print(f"  {repr(live_diff[:200])}")
+                        
+                        # 如果fix.patch不存在但git diff有输出，可以直接用这个
+                        if not os.path.exists(fix_patch_file) and live_diff.strip():
+                            print(f"[INFO] fix.patch不存在，但git diff有输出，自动保存为fix.patch")
+                            with open(fix_patch_file, 'w', encoding='utf-8') as f:
+                                f.write(live_diff)
+                            print(f"✓ 已自动生成fix.patch")
+                    else:
+                        print(f"[DEBUG] 实时 git diff 为空 (工作区无修改)")
+            except subprocess.TimeoutExpired:
+                print(f"[DEBUG] git命令超时")
+            except Exception as e:
+                print(f"[DEBUG] 检查git状态失败: {e}")
             
             if os.path.exists(fix_patch_file):
                 try:
+                    file_size = os.path.getsize(fix_patch_file)
+                    print(f"[DEBUG] fix.patch 文件大小: {file_size} bytes")
+                    
                     with open(fix_patch_file, 'r', encoding='utf-8') as f:
-                        patch = f.read().strip()
+                        raw_patch = f.read()
+                    
+                    print(f"[DEBUG] fix.patch 原始内容长度: {len(raw_patch)}")
+                    print(f"[DEBUG] fix.patch 前100字符 (repr): {repr(raw_patch[:100])}")
+                    
+                    # 只strip开头的空白，保留末尾换行符（git apply需要）
+                    patch = raw_patch.lstrip()
+                    # 确保末尾有且只有一个换行符
+                    patch = patch.rstrip() + '\n'
+                    
                     if patch and ('diff --git' in patch or '@@' in patch):
-                        print(f"✓ 从fix.patch文件读取到patch (长度: {len(patch)} 字符)")
+                        print(f"✓ 从fix.patch文件读取到有效patch (长度: {len(patch)} 字符)")
+                        patch_source = "fix.patch"
+                        
+                        # 验证patch格式完整性
+                        lines = patch.split('\n')
+                        print(f"[DEBUG] patch 行数: {len(lines)}")
+                        print(f"[DEBUG] 第一行: {repr(lines[0][:80]) if lines else 'N/A'}")
+                        
+                        # 检查上下文行是否有前导空格
+                        context_lines = [l for l in lines if l and not l.startswith(('diff', '---', '+++', '@@', '-', '+', 'index', 'Binary'))]
+                        if context_lines:
+                            print(f"[DEBUG] 上下文行示例: {repr(context_lines[0][:60])}")
+                            if not context_lines[0].startswith(' '):
+                                print(f"⚠️  [WARNING] 上下文行缺少前导空格，patch可能格式错误!")
+                        
+                        # 验证fix.patch确实是git diff生成的：对比实时git diff
+                        try:
+                            result = subprocess.run(
+                                ['git', 'diff'],
+                                cwd=workspace,
+                                capture_output=True,
+                                text=True,
+                                timeout=30
+                            )
+                            current_diff = result.stdout.strip()
+                            
+                            if current_diff:
+                                # git diff有输出，说明工作区还有修改（agent可能没执行git reset验证）
+                                if current_diff == patch:
+                                    print(f"✓ [验证通过] fix.patch 内容与当前 git diff 完全一致")
+                                    print(f"  → 确认是通过 git diff 生成的")
+                                else:
+                                    print(f"⚠️  [注意] fix.patch 与当前 git diff 不完全一致")
+                                    print(f"  fix.patch 长度: {len(patch)}, 当前 git diff 长度: {len(current_diff)}")
+                                    # 可能是agent执行了git reset验证后又改了代码
+                            else:
+                                # git diff为空，说明工作区已经干净
+                                # 可能是agent执行了git reset --hard (按照prompt的验证步骤)
+                                # 或者agent撤销了修改
+                                print(f"[DEBUG] 当前 git diff 为空 (工作区无修改)")
+                                print(f"  → agent 可能已执行 git reset --hard 验证了 patch")
+                        except Exception as e:
+                            print(f"[DEBUG] 对比git diff失败: {e}")
                     else:
-                        print(f"⚠️  fix.patch文件存在但内容无效，尝试其他来源")
+                        print(f"⚠️  fix.patch文件存在但内容无效")
+                        print(f"[DEBUG] 内容不包含 'diff --git' 或 '@@'")
+                        print(f"[DEBUG] 前200字符: {patch[:200]}")
                         patch = ""
                 except Exception as e:
                     print(f"⚠️  读取fix.patch失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"[DEBUG] fix.patch 文件不存在")
+                print(f"  → 依赖前面自动生成的 git diff 补救")
             
-            # 备用方案1：从输出中提取
+            # 如果仍然没有patch，说明agent没有修改任何文件
             if not patch:
-                print(f"  尝试从ducc输出中提取patch...")
-                patch = self._extract_patch(output)
+                print(f"\n⚠️  未找到有效的patch!")
+                print(f"  可能原因:")
+                print(f"  1. Agent 没有修改任何代码文件")
+                print(f"  2. Agent 没有执行 git diff > fix.patch")
+                print(f"  3. 工作区不是 git 仓库")
             
-            # 备用方案2：从debug文件提取（tmux模式）
-            if self.use_tmux and (not patch or ('diff --git' not in patch and '@@' not in patch)):
-                print(f"  ⚠️  从输出中未提取到有效patch，尝试其他来源...")
-                
-                debug_file = os.path.join(task_dir, 'ducc_debug.log')
-                if os.path.exists(debug_file):
-                    try:
-                        with open(debug_file, 'r', encoding='utf-8') as f:
-                            debug_content = f.read()
-                        debug_patch = self._extract_patch(debug_content)
-                        if debug_patch and ('diff --git' in debug_patch or '@@' in debug_patch):
-                            print(f"  ✓ 从debug文件中成功提取patch (长度: {len(debug_patch)})")
-                            patch = debug_patch
-                    except Exception as e:
-                        print(f"  ✗ 读取debug文件失败: {e}")
-                
-                # 备用方案3：从workspace中查找其他.diff或.patch文件
-                if not patch or ('diff --git' not in patch and '@@' not in patch):
-                    print(f"  尝试从workspace查找其他patch文件...")
-                    try:
-                        import glob
-                        diff_files = glob.glob(os.path.join(workspace, '*.diff')) + \
-                                    glob.glob(os.path.join(workspace, '*.patch'))
-                        # 排除fix.patch（已经检查过了）
-                        diff_files = [f for f in diff_files if f != fix_patch_file]
-                        if diff_files:
-                            # 选择最新的文件
-                            latest_diff = max(diff_files, key=os.path.getmtime)
-                            with open(latest_diff, 'r', encoding='utf-8') as f:
-                                file_patch = f.read()
-                            if file_patch and ('diff --git' in file_patch or '@@' in file_patch):
-                                print(f"  ✓ 从文件中找到patch: {os.path.basename(latest_diff)} (长度: {len(file_patch)})")
-                                patch = file_patch
-                    except Exception as e:
-                        print(f"  ✗ 查找patch文件失败: {e}")
+            # 汇总patch来源
+            print(f"\n{'='*60}")
+            print(f"📊 Patch 提取结果汇总")
+            print(f"{'='*60}")
+            print(f"Patch 来源: {patch_source}")
+            print(f"Patch 长度: {len(patch)} 字符")
+            print(f"Patch 有效: {'是' if patch and ('diff --git' in patch or '@@' in patch) else '否'}")
             
             # 保存提取的patch
             if patch:
+                # 确保patch末尾有换行符（git apply需要）
+                if not patch.endswith('\n'):
+                    patch = patch + '\n'
+                    print(f"[DEBUG] 已补充patch末尾换行符")
+                
                 patch_file = os.path.join(task_dir, 'extracted_patch.diff')
                 try:
                     with open(patch_file, 'w', encoding='utf-8') as f:
                         f.write(patch)
                     print(f"✓ Patch 已保存: {patch_file}")
+                    
+                    # 同时保存patch来源信息
+                    patch_info_file = os.path.join(task_dir, 'patch_source_info.json')
+                    patch_info = {
+                        'source': patch_source,
+                        'length': len(patch),
+                        'has_diff_git': 'diff --git' in patch,
+                        'has_hunk_header': '@@' in patch,
+                        'line_count': len(patch.split('\n')),
+                        'first_line': patch.split('\n')[0][:100] if patch else '',
+                    }
+                    with open(patch_info_file, 'w', encoding='utf-8') as f:
+                        json.dump(patch_info, f, indent=2)
+                    print(f"✓ Patch 来源信息已保存: {patch_info_file}")
                 except Exception as e:
                     print(f"⚠️  保存 patch 失败: {e}")
             
@@ -1388,17 +2065,160 @@ class SimpleDuccEvaluator:
             
             # 保存任务摘要
             self._save_task_summary(task_dir, result, start_time)
-            
+
             return result
-        
+
         finally:
             # 清理临时目录
             if tmpdir_to_cleanup:
                 import shutil
                 shutil.rmtree(tmpdir_to_cleanup, ignore_errors=True)
-    
+
+    def _evaluate_single_in_container(self, instance: Dict, instance_id: str, task_dir: str,
+                                       start_time: float, output_dir: str) -> Dict:
+        """容器内模式：在 Docker 容器内直接运行 ducc"""
+        import tarfile
+        import io
+
+        # 1. 启动容器（会自动注入 ducc）
+        if DOCKER_IMAGE_PREFIX:
+            image_tag = f"{DOCKER_IMAGE_PREFIX}:{instance['dockerhub_tag']}"
+        else:
+            image_tag = instance['dockerhub_tag']
+
+        container = self._get_or_create_container(image_tag)
+
+        # 2. 探测容器内工作目录
+        workdir = self._detect_container_workdir(container)
+
+        # 3. 构建 prompt
+        prompt = self._build_prompt(instance)
+
+        # 4. 在容器内运行 ducc
+        output = self.call_ducc_in_container(
+            container, prompt, workdir,
+            timeout=self.timeout,
+            use_tmux=self.use_tmux,
+            instance_id=instance_id,
+            task_dir=task_dir,
+        )
+
+        # 保存 ducc 原始输出
+        raw_output_file = os.path.join(task_dir, 'ducc_raw_output.txt')
+        try:
+            with open(raw_output_file, 'w', encoding='utf-8') as f:
+                f.write(output if output else "(空输出)")
+        except Exception as e:
+            print(f"⚠️  保存原始输出失败: {e}")
+
+        if not output:
+            error_result = {
+                'instance_id': instance_id,
+                'patch': '',
+                'error': 'ducc returned empty output (in-container mode)',
+                'validation': {'success': False, 'error': 'Empty output'},
+                'task_dir': task_dir,
+            }
+            self._save_task_summary(task_dir, error_result, start_time)
+            return error_result
+
+        # 5. 从容器提取 patch（优先 git diff，最可靠）
+        patch = ""
+        patch_source = "none"
+
+        # 方法1: 直接在容器内执行 git diff（以 ducc 用户，确保权限一致）
+        try:
+            git_diff_cmd = [
+                'docker', 'exec',
+                '--user', 'ducc',
+                '-e', 'HOME=/home/ducc',
+                container.id,
+                'bash', '-c', f'cd {workdir} && git diff',
+            ]
+            diff_result = subprocess.run(
+                git_diff_cmd, capture_output=True, text=True, timeout=30
+            )
+            if diff_result.returncode == 0:
+                live_diff = diff_result.stdout
+                if live_diff and ('diff --git' in live_diff or '@@' in live_diff):
+                    patch = live_diff
+                    patch_source = "git diff (from container)"
+                    print(f"✓ 从容器 git diff 获取 patch ({len(patch)} 字符)")
+        except Exception as e:
+            print(f"  git diff 执行失败: {e}")
+
+        # 方法2: fallback 到容器内的 fix.patch 文件（agent 可能自己生成了）
+        if not patch:
+            fix_patch_path = f"{workdir}/fix.patch"
+            try:
+                bits, stat = container.get_archive(fix_patch_path)
+                tar_data = b''.join(bits)
+                with tarfile.open(fileobj=io.BytesIO(tar_data), mode='r') as tar:
+                    for member in tar.getmembers():
+                        f = tar.extractfile(member)
+                        if f:
+                            patch = f.read().decode('utf-8', errors='replace')
+                            break
+
+                if patch and ('diff --git' in patch or '@@' in patch):
+                    patch_source = "fix.patch (from container)"
+                    print(f"✓ 从容器 fix.patch 提取 patch ({len(patch)} 字符)")
+                else:
+                    patch = ""
+            except Exception as e:
+                print(f"  fix.patch 不存在或无法提取: {e}")
+
+        # 保存 patch
+        if patch:
+            if not patch.endswith('\n'):
+                patch = patch + '\n'
+            patch_file = os.path.join(task_dir, 'extracted_patch.diff')
+            with open(patch_file, 'w', encoding='utf-8') as f:
+                f.write(patch)
+            print(f"✓ Patch 已保存: {patch_file} (来源: {patch_source})")
+
+            print(f"\nPatch 预览:")
+            print("-" * 60)
+            print(patch[:300])
+            if len(patch) > 300:
+                print(f"... (还有 {len(patch) - 300} 字符)")
+            print("-" * 60)
+        else:
+            print(f"\n✗ 未能从容器获取 patch")
+
+        # 6. 验证（复用已有的 validate_patch）
+        validation_result = {}
+        if ENABLE_VALIDATION and patch:
+            print("\n正在验证 patch...")
+            validation_result = self.validate_patch(instance, patch, workdir)
+            print(f"验证结果: {'✓ 通过' if validation_result.get('success') else '✗ 失败'}")
+            validation_file = os.path.join(task_dir, 'validation_result.json')
+            with open(validation_file, 'w', encoding='utf-8') as f:
+                json.dump(validation_result, f, indent=2)
+
+        # 7. 从容器内提取 Claude session 轨迹
+        print("\n正在从容器提取 Claude session 轨迹...")
+        self._copy_claude_session_from_container(container, task_dir, start_time)
+
+        duration = time.time() - start_time
+        print(f"\n✓ 容器内模式处理完成: {duration:.2f}s, patch: {len(patch)} 字符")
+
+        result = {
+            'instance_id': instance_id,
+            'patch': patch,
+            'duration': duration,
+            'validation': validation_result,
+            'task_dir': task_dir,
+        }
+        self._save_task_summary(task_dir, result, start_time)
+        return result
+
     def _build_prompt(self, instance: Dict) -> str:
-        """构建 prompt (agent 可以自己探索代码,不需要提供文件列表)"""
+        """构建 prompt - 问题+需求+参考，agent自动解决
+        
+        关键改进：让 agent 直接修改源代码文件，然后用 git 生成 patch
+        这避免了 LLM 手写 patch format 的错误（缺少上下文行、行号不对等）
+        """
         # 清理 problem_statement，移除可能的序列化引号
         problem_stmt = instance['problem_statement']
         if isinstance(problem_stmt, str):
@@ -1409,7 +2229,7 @@ class SimpleDuccEvaluator:
             problem_stmt = problem_stmt.replace('\\n', '\n')
         
         requirements = f"\n## Requirements\n{instance['requirements']}\n" if instance.get('requirements') else ""
-        interface = f"\n## Interface\n{instance['interface']}\n" if instance.get('interface') else ""
+        interface = f"\n## Reference (Interface Hints)\n{instance['interface']}\n" if instance.get('interface') else ""
         
         return f"""You are a software engineer fixing a bug. The codebase is in the current directory.
 
@@ -1418,25 +2238,30 @@ class SimpleDuccEvaluator:
 {requirements}{interface}
 
 ## Task
-1. Explore the codebase in the current directory to understand the structure
-2. Locate the relevant files related to this issue
-3. Generate a patch that fixes the issue with minimal, targeted changes
-4. **IMPORTANT**: Save the final patch to a file named `fix.patch` in the current directory
-5. The patch should be in unified diff format
+Solve this problem by implementing the required changes to the codebase. 
 
-## Output Format
-After you complete the fix, use the Write tool to save the patch to `fix.patch`:
+**IMPORTANT**: Do NOT manually generate patch format. Instead:
+1. **Directly modify the source code files** in the codebase to fix the bug
+2. **Use git to generate the patch**: 
+   ```bash
+   git diff > fix.patch
+   ```
+3. **Verify the patch applies cleanly**:
+   ```bash
+   git reset --hard HEAD
+   git apply fix.patch
+   ```
+   If the patch applies without errors, the fix is complete.
 
-```diff
-diff --git a/file.py b/file.py
---- a/file.py
-+++ b/file.py
-@@ -10,5 +10,5 @@ def func():
--    old_line
-+    new_line
-```
+## Workflow
+1. Explore the codebase to understand the structure
+2. Locate the bug and identify files that need changes
+3. Make the necessary code modifications (using Edit operations)
+4. Generate the patch file using `git diff > fix.patch`
+5. Verify the patch with git apply
+6. Report completion - the file `fix.patch` must remain in the current directory
 
-**CRITICAL**: You MUST write the final patch to the file `fix.patch` in the current directory. This is mandatory."""
+This approach ensures the patch format is always correct since git generates it, not manual writing."""
     
     def _extract_patch(self, output: str) -> str:
         """从 ducc 输出提取 patch"""
@@ -1881,13 +2706,16 @@ def main():
   tmux 模式会自动激活 conda 环境（默认: dejavu），也可通过 --conda-env 指定
   
 推荐工作流程:
-  1. 单个任务测试:
+  1. 单个任务测试（通过索引）:
      python test_tmux_cc_experience.py --index 0 --no-validate
   
-  2. 批量处理（前N个任务）:
+  2. 单个任务测试（通过 instance_id）:
+     python test_tmux_cc_experience.py --instance-id "instance_NodeBB__NodeBB-xxx" --no-validate
+  
+  3. 批量处理（前N个任务）:
      python test_tmux_cc_experience.py --max-tasks 10 --no-validate
   
-  3. 指定范围处理（适合分批次运行）:
+  4. 指定范围处理（适合分批次运行）:
      # 第一批: 处理 0-50
      python test_tmux_cc_experience.py --start-index 0 --end-index 50 --no-validate
      
@@ -1897,22 +2725,26 @@ def main():
      # 第三批: 处理 100-150
      python test_tmux_cc_experience.py --start-index 100 --end-index 150 --no-validate
   
-  4. tmux 模式（可实时查看）:
+  5. tmux 模式（可实时查看）:
      # 单个任务
      python test_tmux_cc_experience.py --index 0 --use-tmux --no-validate
+     
+     # 通过 instance_id
+     python test_tmux_cc_experience.py --instance-id "instance_xxx" --use-tmux --no-validate
      
      # 在另一个终端查看: tmux attach -t swe_bench_<instance_id>
      
      # 指定 conda 环境
      python test_tmux_cc_experience.py --index 0 --use-tmux --conda-env myenv
   
-  5. 查看结果:
+  6. 查看结果:
      cat swe_bench_output_ducc/report.json
      ls -la swe_bench_output_ducc/tasks/<instance_id>/
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument('--index', type=int, help='任务索引（单个任务）')
+    parser.add_argument('--instance-id', type=str, help='直接指定 instance_id（单个任务）')
     parser.add_argument('--max-tasks', type=int, help='最多处理 N 个任务（从索引0开始）')
     parser.add_argument('--start-index', type=int, help='起始索引（包含，配合 --end-index 使用）')
     parser.add_argument('--end-index', type=int, help='结束索引（不包含，配合 --start-index 使用）')
@@ -1924,6 +2756,8 @@ def main():
                        help='tmux 模式下使用的 conda 环境名称 (默认: dejavu)')
     parser.add_argument('--timeout', type=int, default=1800,
                        help='ducc 执行超时时间（秒），默认 1800 (30分钟)')
+    parser.add_argument('--in-container', action='store_true',
+                       help='在 Docker 容器内直接运行 ducc（无需在宿主机安装 ducc，自动注入）')
     parser.add_argument('--output-dir', default='./swe_bench_output_ducc', help='输出目录')
     args = parser.parse_args()
     
@@ -1937,18 +2771,19 @@ def main():
             print(f"💡 将使用默认 conda 环境: {args.conda_env}")
     
     # 参数验证
-    if args.index is None and not args.max_tasks and not (args.start_index is not None and args.end_index is not None):
+    if args.instance_id is None and args.index is None and not args.max_tasks and not (args.start_index is not None and args.end_index is not None):
         parser.error("必须指定以下之一:\n"
+                    "  --instance-id <id>             (指定 instance_id)\n"
                     "  --index <N>                    (单个任务)\n"
                     "  --max-tasks <N>                (前 N 个任务，从0开始)\n"
                     "  --start-index <N> --end-index <M>  (任务范围 [N, M))")
     
     # 检查参数冲突
-    if args.index is not None and (args.max_tasks or args.start_index is not None or args.end_index is not None):
-        parser.error("--index 不能与 --max-tasks, --start-index, --end-index 同时使用")
-    
-    if args.max_tasks and (args.start_index is not None or args.end_index is not None):
-        parser.error("--max-tasks 不能与 --start-index, --end-index 同时使用")
+    mutually_exclusive = [args.instance_id is not None, args.index is not None, 
+                          args.max_tasks is not None, 
+                          (args.start_index is not None and args.end_index is not None)]
+    if sum(mutually_exclusive) > 1:
+        parser.error("--instance-id, --index, --max-tasks, (--start-index + --end-index) 互斥，只能选择其中一个")
     
     if (args.start_index is not None) != (args.end_index is not None):
         parser.error("--start-index 和 --end-index 必须同时指定")
@@ -1973,21 +2808,38 @@ def main():
     print(f"使用模型: DUCC (独立版,无 Experience 依赖)")
     print(f"数据集: SWE-bench Pro (41 repos, 多语言)")
     print(f"输出目录: {args.output_dir}")
-    print(f"运行模式: {'tmux模式 (可实时查看)' if args.use_tmux else '直接模式'}")
+    if args.in_container:
+        print(f"执行位置: Docker 容器内 (自动注入 ducc)")
+    else:
+        print(f"执行位置: 宿主机")
+    print(f"运行模式: {'tmux模式 (可实时查看)' if args.use_tmux else '直接/exec模式'}")
     print(f"验证模式: {'启用' if ENABLE_VALIDATION else '禁用'}")
     if not ENABLE_VALIDATION:
         print("⚠️  跳过验证,只生成 patches")
-    if args.use_tmux:
+    if args.use_tmux and not args.in_container:
         print("💡 提示: 使用 'tmux attach -t swe_bench_<instance_id>' 查看实时执行")
+    elif args.use_tmux and args.in_container:
+        print("💡 提示: 使用 'docker exec -it <container_id> tmux attach -t ducc_<instance_id>' 查看实时执行")
     print()
     
-    evaluator = SimpleDuccEvaluator(use_tmux=args.use_tmux, timeout=args.timeout)
+    evaluator = SimpleDuccEvaluator(use_tmux=args.use_tmux, timeout=args.timeout, in_container=args.in_container)
     
     try:
         dataset = evaluator.load_dataset()
         
         # 选择任务
-        if args.index is not None:
+        if args.instance_id:
+            # 通过 instance_id 查找
+            instances = [inst for inst in dataset if inst['instance_id'] == args.instance_id]
+            if not instances:
+                print(f"✗ 错误: 未找到 instance_id: {args.instance_id}")
+                print(f"\n可用的 instance_id 示例（前5个）:")
+                for i, inst in enumerate(dataset[:5]):
+                    print(f"  {i}: {inst['instance_id']}")
+                print(f"... (总共 {len(dataset)} 个任务)")
+                sys.exit(1)
+            print(f"\n处理指定任务: {args.instance_id}")
+        elif args.index is not None:
             # 单个任务
             instances = [dataset[args.index]]
             print(f"\n处理单个任务: 索引 {args.index}")
