@@ -45,10 +45,17 @@ from typing import Dict, List, Optional
 import docker
 import docker.types
 
+
+#   test-go.parquet               (Go, 280条)                                                                                                                               
+#   test-js.parquet               (JavaScript, 165条)                                                                                                                       
+#   test-python.parquet           (Python, 266条)                                                                                                                           
+#   test-ts.parquet               (TypeScript, 20条) 
+#   '/ssd1/Dejavu/datasets/SWE-bench_Pro/test-00000-of-00001.parquet'
+
 # 配置
 LOCAL_DATASET_PATH = os.getenv(
     'SWE_BENCH_DATASET',
-    '/ssd1/Dejavu/datasets/SWE-bench_Pro/test-00000-of-00001.parquet'
+    '/ssd1/Dejavu/datasets/SWE-bench_Pro/test-python.parquet'
 )
 
 # Docker 镜像仓库前缀 (可通过环境变量覆盖)
